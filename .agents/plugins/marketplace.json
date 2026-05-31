@@ -1,0 +1,20 @@
+{
+  "name": "abdus-codex",
+  "interface": {
+    "displayName": "Abdus Codex"
+  },
+  "plugins": [
+    {
+      "name": "abdus-codex-pentest-framework",
+      "source": {
+        "source": "local",
+        "path": "./plugins/abdus-codex-pentest-framework"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
