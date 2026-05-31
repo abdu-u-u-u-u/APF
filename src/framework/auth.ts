@@ -1,0 +1,413 @@
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { dirname, join, relative } from "node:path"
+
+export type AuthSessionState = "valid" | "stale" | "blocked" | "unknown"
+export type AuthFailureState = "blocked" | "requires_operator" | "retry_after" | "killed"
+
+export type AuthSessionRecord = {
+  id: string
+  account?: string
+  host?: string
+  state: AuthSessionState
+  method?: string
+  browser_profile?: string
+  artifacts: string[]
+  evidence: string[]
+  captured_at?: string
+  validated_at?: string
+  expires_at?: string
+  updated_at: string
+  notes?: string
+}
+
+export type AuthFailureRecord = {
+  id: string
+  flow: string
+  host?: string
+  account?: string
+  state: AuthFailureState
+  reason: string
+  evidence: string[]
+  recorded_at: string
+  updated_at: string
+  retry_after?: string
+  reopen_criteria?: string
+}
+
+export type AuthSessionRegistry = {
+  schema: "abdus-pentest-framework.session-registry.v1"
+  sessions: AuthSessionRecord[]
+}
+
+export type AuthFailureRegistry = {
+  schema: "abdus-pentest-framework.auth-failures.v1"
+  failures: AuthFailureRecord[]
+}
+
+export type AuthStatusFilter = {
+  host?: string
+  account?: string
+  method?: string
+  flow?: string
+}
+
+export type AuthStatusSession = AuthSessionRecord & {
+  effective_state: "valid" | "stale" | "blocked" | "unknown"
+  stale_reason?: string
+}
+
+export type AuthStatusSummary = {
+  sessions: AuthStatusSession[]
+  blockers: AuthFailureRecord[]
+  counts: {
+    valid: number
+    stale: number
+    blocked: number
+    unknown: number
+    blockers: number
+  }
+  recommended_action: string
+}
+
+export type AuthRecordInput = {
+  id?: string
+  account?: string
+  host?: string
+  state: AuthSessionState
+  method?: string
+  browser_profile?: string
+  artifacts?: string[]
+  evidence?: string[]
+  captured_at?: string
+  validated_at?: string
+  expires_at?: string
+  notes?: string
+}
+
+export type AuthFailureInput = {
+  id?: string
+  flow: string
+  host?: string
+  account?: string
+  state: AuthFailureState
+  reason: string
+  evidence?: string[]
+  retry_after?: string
+  reopen_criteria?: string
+}
+
+const SESSION_REGISTRY_PATH = join("access", "session-registry.json")
+const AUTH_FAILURES_PATH = join("framework", "auth-failures.json")
+
+function now(): string {
+  return new Date().toISOString()
+}
+
+function safeSegment(input: string | undefined, fallback: string): string {
+  const value = (input ?? fallback)
+    .toLowerCase()
+    .replace(/[^a-z0-9_.-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80)
+  return value || fallback
+}
+
+function rel(directory: string, path: string): string {
+  const relativePath = relative(directory, path)
+  return relativePath && !relativePath.startsWith("..") ? relativePath : path
+}
+
+function readJsonFile<T>(path: string, fallback: T): T {
+  try {
+    if (!existsSync(path)) return fallback
+    return JSON.parse(readFileSync(path, "utf8")) as T
+  } catch {
+    return fallback
+  }
+}
+
+function writeJson(path: string, value: unknown): void {
+  mkdirSync(dirname(path), { recursive: true })
+  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`)
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return [
+    ...new Set(value.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map((item) => item.trim())),
+  ]
+}
+
+function recordObject(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined
+}
+
+function normalizeSession(value: unknown): AuthSessionRecord | undefined {
+  const record = recordObject(value)
+  const account = optionalString(record.account)
+  const host = optionalString(record.host)
+  const method = optionalString(record.method)
+  const state = optionalString(record.state)
+  const normalizedState: AuthSessionState =
+    state === "valid" || state === "stale" || state === "blocked" || state === "unknown" ? state : "unknown"
+  const id = optionalString(record.id) ?? sessionKey({ account, host, method })
+  return {
+    id,
+    account,
+    host,
+    state: normalizedState,
+    method,
+    browser_profile: optionalString(record.browser_profile),
+    artifacts: stringArray(record.artifacts),
+    evidence: stringArray(record.evidence),
+    captured_at: optionalString(record.captured_at),
+    validated_at: optionalString(record.validated_at),
+    expires_at: optionalString(record.expires_at),
+    updated_at: optionalString(record.updated_at) ?? now(),
+    notes: optionalString(record.notes),
+  }
+}
+
+function normalizeFailure(value: unknown): AuthFailureRecord | undefined {
+  const record = recordObject(value)
+  const flow = optionalString(record.flow)
+  if (!flow) return undefined
+  const state = optionalString(record.state)
+  const normalizedState: AuthFailureState =
+    state === "blocked" || state === "requires_operator" || state === "retry_after" || state === "killed" ? state : "blocked"
+  const host = optionalString(record.host)
+  const account = optionalString(record.account)
+  const id = optionalString(record.id) ?? failureKey({ flow, host, account })
+  return {
+    id,
+    flow,
+    host,
+    account,
+    state: normalizedState,
+    reason: optionalString(record.reason) ?? "auth flow failed",
+    evidence: stringArray(record.evidence),
+    recorded_at: optionalString(record.recorded_at) ?? now(),
+    updated_at: optionalString(record.updated_at) ?? now(),
+    retry_after: optionalString(record.retry_after),
+    reopen_criteria: optionalString(record.reopen_criteria),
+  }
+}
+
+function sessionKey(input: { account?: string; host?: string; method?: string }): string {
+  return [safeSegment(input.account, "account"), safeSegment(input.host, "host"), safeSegment(input.method, "session")].join(":")
+}
+
+function failureKey(input: { flow: string; host?: string; account?: string }): string {
+  return [safeSegment(input.flow, "flow"), safeSegment(input.host, "host"), safeSegment(input.account, "account")].join(":")
+}
+
+function matchesFilter(record: { account?: string; host?: string; method?: string; flow?: string }, filter: AuthStatusFilter): boolean {
+  if (filter.account && record.account !== filter.account) return false
+  if (filter.host && record.host !== filter.host) return false
+  if (filter.method && record.method !== filter.method) return false
+  if (filter.flow && record.flow !== filter.flow) return false
+  return true
+}
+
+function sessionEffectiveState(session: AuthSessionRecord, timestamp = Date.now()): Pick<AuthStatusSession, "effective_state" | "stale_reason"> {
+  if (session.state === "blocked") return { effective_state: "blocked" }
+  if (session.state === "unknown") return { effective_state: "unknown" }
+  if (session.state === "stale") return { effective_state: "stale", stale_reason: "recorded stale" }
+  if (session.expires_at) {
+    const expires = Date.parse(session.expires_at)
+    if (Number.isFinite(expires) && expires <= timestamp) return { effective_state: "stale", stale_reason: "expires_at elapsed" }
+  }
+  return { effective_state: "valid" }
+}
+
+export function readSessionRegistry(directory: string): AuthSessionRegistry {
+  const parsed = readJsonFile<unknown>(join(directory, SESSION_REGISTRY_PATH), { sessions: [] })
+  const record = recordObject(parsed)
+  const sessions = Array.isArray(record.sessions) ? record.sessions.map(normalizeSession).filter((item): item is AuthSessionRecord => Boolean(item)) : []
+  return {
+    schema: "abdus-pentest-framework.session-registry.v1",
+    sessions,
+  }
+}
+
+export function writeSessionRegistry(directory: string, registry: AuthSessionRegistry): void {
+  writeJson(join(directory, SESSION_REGISTRY_PATH), {
+    schema: "abdus-pentest-framework.session-registry.v1",
+    sessions: registry.sessions,
+  })
+}
+
+export function readAuthFailures(directory: string): AuthFailureRegistry {
+  const parsed = readJsonFile<unknown>(join(directory, AUTH_FAILURES_PATH), { failures: [] })
+  const record = recordObject(parsed)
+  const failures = Array.isArray(record.failures) ? record.failures.map(normalizeFailure).filter((item): item is AuthFailureRecord => Boolean(item)) : []
+  return {
+    schema: "abdus-pentest-framework.auth-failures.v1",
+    failures,
+  }
+}
+
+export function writeAuthFailures(directory: string, registry: AuthFailureRegistry): void {
+  writeJson(join(directory, AUTH_FAILURES_PATH), {
+    schema: "abdus-pentest-framework.auth-failures.v1",
+    failures: registry.failures,
+  })
+}
+
+export function recordAuthSession(directory: string, input: AuthRecordInput): AuthSessionRecord {
+  const registry = readSessionRegistry(directory)
+  const timestamp = now()
+  const id = input.id?.trim() || sessionKey(input)
+  const existing = registry.sessions.find((session) => session.id === id)
+  const session: AuthSessionRecord = {
+    id,
+    account: input.account?.trim() || existing?.account,
+    host: input.host?.trim() || existing?.host,
+    state: input.state,
+    method: input.method?.trim() || existing?.method,
+    browser_profile: input.browser_profile?.trim() || existing?.browser_profile,
+    artifacts: stringArray([...(existing?.artifacts ?? []), ...(input.artifacts ?? [])]),
+    evidence: stringArray([...(existing?.evidence ?? []), ...(input.evidence ?? [])]),
+    captured_at: input.captured_at?.trim() || existing?.captured_at || timestamp,
+    validated_at: input.validated_at?.trim() || (input.state === "valid" ? timestamp : existing?.validated_at),
+    expires_at: input.expires_at?.trim() || existing?.expires_at,
+    updated_at: timestamp,
+    notes: input.notes?.trim() || existing?.notes,
+  }
+  registry.sessions = [session, ...registry.sessions.filter((candidate) => candidate.id !== id)]
+  writeSessionRegistry(directory, registry)
+  return session
+}
+
+export function recordAuthFailure(directory: string, input: AuthFailureInput): AuthFailureRecord {
+  const registry = readAuthFailures(directory)
+  const timestamp = now()
+  const id = input.id?.trim() || failureKey(input)
+  const existing = registry.failures.find((failure) => failure.id === id)
+  const failure: AuthFailureRecord = {
+    id,
+    flow: input.flow.trim(),
+    host: input.host?.trim() || existing?.host,
+    account: input.account?.trim() || existing?.account,
+    state: input.state,
+    reason: input.reason.trim(),
+    evidence: stringArray([...(existing?.evidence ?? []), ...(input.evidence ?? [])]),
+    recorded_at: existing?.recorded_at ?? timestamp,
+    updated_at: timestamp,
+    retry_after: input.retry_after?.trim() || existing?.retry_after,
+    reopen_criteria: input.reopen_criteria?.trim() || existing?.reopen_criteria,
+  }
+  registry.failures = [failure, ...registry.failures.filter((candidate) => candidate.id !== id)]
+  writeAuthFailures(directory, registry)
+  return failure
+}
+
+export function resetAuthFailure(directory: string, filter: { id?: string; flow?: string; host?: string; account?: string }): AuthFailureRecord[] {
+  const registry = readAuthFailures(directory)
+  const removed: AuthFailureRecord[] = []
+  const kept = registry.failures.filter((failure) => {
+    const idMatch = filter.id ? failure.id === filter.id : true
+    const flowMatch = filter.flow ? failure.flow === filter.flow : true
+    const hostMatch = filter.host ? failure.host === filter.host : true
+    const accountMatch = filter.account ? failure.account === filter.account : true
+    const match = idMatch && flowMatch && hostMatch && accountMatch
+    if (match) removed.push(failure)
+    return !match
+  })
+  registry.failures = kept
+  writeAuthFailures(directory, registry)
+  return removed
+}
+
+function browserProxyProbeUsable(directory: string): boolean {
+  const file = join(directory, "access", "network", "browser-proxy-probe-latest.json")
+  try {
+    if (!existsSync(file)) return false
+    const status = JSON.parse(readFileSync(file, "utf8")) as { browser_proxy_usable?: unknown; conclusion?: unknown }
+    return status.browser_proxy_usable === true || status.conclusion === "usable"
+  } catch {
+    return false
+  }
+}
+
+function isBrowserProxyFailure(failure: AuthFailureRecord): boolean {
+  const haystack = [failure.id, failure.flow, failure.reason, failure.reopen_criteria, ...failure.evidence].join(" ").toLowerCase()
+  return (
+    haystack.includes("chrome_proxy") ||
+    haystack.includes("browser_proxy") ||
+    haystack.includes("chrome/playwright proxy") ||
+    haystack.includes("chrome proxy") ||
+    haystack.includes("browser proxy") ||
+    haystack.includes("playwright proxy")
+  )
+}
+
+export function resetSupersededBrowserProxyFailures(directory: string): AuthFailureRecord[] {
+  if (!browserProxyProbeUsable(directory)) return []
+  const registry = readAuthFailures(directory)
+  const removed: AuthFailureRecord[] = []
+  registry.failures = registry.failures.filter((failure) => {
+    const superseded = isBrowserProxyFailure(failure)
+    if (superseded) removed.push(failure)
+    return !superseded
+  })
+  if (removed.length) writeAuthFailures(directory, registry)
+  return removed
+}
+
+export function summarizeAuthStatus(directory: string, filter: AuthStatusFilter = {}): AuthStatusSummary {
+  const sessions = readSessionRegistry(directory)
+    .sessions.filter((session) => matchesFilter(session, filter))
+    .map((session) => ({
+      ...session,
+      ...sessionEffectiveState(session),
+    }))
+  const blockers = readAuthFailures(directory).failures.filter((failure) => matchesFilter(failure, filter))
+  const counts = {
+    valid: sessions.filter((session) => session.effective_state === "valid").length,
+    stale: sessions.filter((session) => session.effective_state === "stale").length,
+    blocked: sessions.filter((session) => session.effective_state === "blocked").length,
+    unknown: sessions.filter((session) => session.effective_state === "unknown").length,
+    blockers: blockers.length,
+  }
+  const recommended_action =
+    counts.blockers > 0
+      ? "Do not retry sticky-blocked auth flows unless auth_failure_reset is called for the exact flow."
+      : counts.valid > 0
+        ? "Reuse the valid workspace-local session artifact for the matching method before any signin/signup attempt."
+        : counts.stale > 0
+          ? "Refresh the stale session once using the recorded method/artifacts, then auth_record the method-scoped result."
+          : "No reusable auth session is recorded for this method. Use owned-account artifacts or browser_capture, then auth_record success or auth_failure_record blockers."
+
+  return { sessions, blockers, counts, recommended_action }
+}
+
+export function formatAuthStatus(summary: AuthStatusSummary): string[] {
+  const lines = [
+    `- Sessions: valid=${summary.counts.valid} stale=${summary.counts.stale} blocked=${summary.counts.blocked} unknown=${summary.counts.unknown}`,
+    `- Sticky blockers: ${summary.counts.blockers}`,
+    `- Auth next action: ${summary.recommended_action}`,
+  ]
+  for (const session of summary.sessions.slice(0, 5)) {
+    const label = [session.account ?? "account?", session.host ?? "host?", session.method ?? "session"].join(" / ")
+    const artifacts = session.artifacts.length ? ` artifacts=${session.artifacts.slice(0, 3).join(",")}` : ""
+    const browserProfile = session.browser_profile ? ` browser_profile=${session.browser_profile}` : ""
+    lines.push(`- ${label}: ${session.effective_state}${session.stale_reason ? ` (${session.stale_reason})` : ""}${browserProfile}${artifacts}`)
+  }
+  for (const blocker of summary.blockers.slice(0, 5)) {
+    const scope = [blocker.flow, blocker.account, blocker.host].filter(Boolean).join(" / ")
+    lines.push(`- blocked ${scope}: ${blocker.state}; ${blocker.reason}`)
+  }
+  return lines
+}
+
+export function authArtifactPaths(directory: string): { session_registry: string; auth_failures: string } {
+  return {
+    session_registry: rel(directory, join(directory, SESSION_REGISTRY_PATH)),
+    auth_failures: rel(directory, join(directory, AUTH_FAILURES_PATH)),
+  }
+}

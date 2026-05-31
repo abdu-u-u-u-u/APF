@@ -1,0 +1,348 @@
+import { existsSync, readFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { basename, join, relative } from "node:path"
+import { startMcpServer, type McpToolDefinition } from "./protocol"
+import {
+  boundedContent,
+  countByMetadata,
+  fileSize,
+  lookupDocument,
+  normalizePathId,
+  resultSummary,
+  searchDocuments,
+  walkFiles,
+  type DocumentHeading,
+  type DocumentMetadata,
+  type SearchChunk,
+  type SearchDocument,
+} from "./search-core"
+
+const VERSION = "0.1.0"
+const ROOT = process.env.NUCLEI_TEMPLATES_ROOT ?? join(homedir(), "nuclei-templates")
+
+type TemplateMetadata = {
+  id: string
+  name: string
+  severity: string
+  description: string
+  author: string[]
+  tags: string[]
+  cves: string[]
+  cwes: string[]
+  references: string[]
+}
+
+let documentCache: SearchDocument[] | undefined
+
+function stringArg(args: Record<string, unknown>, name: string, fallback = ""): string {
+  const value = args[name]
+  return typeof value === "string" ? value : fallback
+}
+
+function numberArg(args: Record<string, unknown>, name: string, fallback: number): number {
+  const value = args[name]
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback
+}
+
+function booleanArg(args: Record<string, unknown>, name: string, fallback = false): boolean {
+  const value = args[name]
+  return typeof value === "boolean" ? value : fallback
+}
+
+function csv(value: string): string[] {
+  return value
+    .split(",")
+    .map((item) => item.trim().replace(/^["']|["']$/g, ""))
+    .filter(Boolean)
+}
+
+function yamlScalar(raw: string, key: string): string {
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  const match = raw.match(new RegExp(`^\\s*${escaped}:\\s*(.+?)\\s*$`, "im"))
+  if (!match) return ""
+  const value = match[1].trim()
+  if (value === "|" || value === ">") return ""
+  return value.replace(/^["']|["']$/g, "")
+}
+
+function yamlList(raw: string, key: string): string[] {
+  const lines = raw.split(/\r?\n/)
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = lines[index].match(new RegExp(`^(\\s*)${escaped}:\\s*(.*)$`, "i"))
+    if (!match) continue
+    const indent = match[1].length
+    const rest = match[2].trim()
+    if (rest) {
+      const trimmed = rest.replace(/^\[|\]$/g, "")
+      return csv(trimmed)
+    }
+    const values: string[] = []
+    for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
+      const line = lines[cursor]
+      if (!line.trim()) continue
+      const currentIndent = line.match(/^\s*/)?.[0].length ?? 0
+      if (currentIndent <= indent) break
+      const item = line.match(/^\s*-\s*(.+?)\s*$/)
+      if (item) values.push(...csv(item[1]))
+    }
+    return values
+  }
+  return []
+}
+
+function yamlBlock(raw: string, key: string): string {
+  const lines = raw.split(/\r?\n/)
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = lines[index].match(new RegExp(`^(\\s*)${escaped}:\\s*([>|])\\s*$`, "i"))
+    if (!match) continue
+    const indent = match[1].length
+    const block: string[] = []
+    for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
+      const line = lines[cursor]
+      if (!line.trim()) {
+        block.push("")
+        continue
+      }
+      const currentIndent = line.match(/^\s*/)?.[0].length ?? 0
+      if (currentIndent <= indent) break
+      block.push(line.slice(Math.min(line.length, indent + 2)))
+    }
+    return block.join("\n").trim()
+  }
+  return ""
+}
+
+function parseMetadata(raw: string, fallbackId: string): TemplateMetadata {
+  const id = yamlScalar(raw, "id") || fallbackId
+  const name = yamlScalar(raw, "name") || id
+  const severity = (yamlScalar(raw, "severity") || "unknown").toLowerCase()
+  const description = yamlBlock(raw, "description") || yamlScalar(raw, "description")
+  const cves = [...yamlList(raw, "cve-id"), ...csv(yamlScalar(raw, "cve"))].map((item) => item.toUpperCase())
+  return {
+    id,
+    name,
+    severity,
+    description,
+    author: yamlList(raw, "author"),
+    tags: yamlList(raw, "tags").map((item) => item.toLowerCase()),
+    cves,
+    cwes: yamlList(raw, "cwe-id").map((item) => item.toUpperCase()),
+    references: yamlList(raw, "reference"),
+  }
+}
+
+function topLevelHeadings(raw: string): DocumentHeading[] {
+  const headings: DocumentHeading[] = []
+  const lines = raw.split(/\r?\n/)
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = lines[index].match(/^([a-zA-Z][a-zA-Z0-9_-]*):/)
+    if (match) headings.push({ level: 1, text: match[1], line: index + 1 })
+  }
+  return headings
+}
+
+function topLevelChunks(raw: string, metadata: TemplateMetadata): SearchChunk[] {
+  const headings = topLevelHeadings(raw)
+  if (!headings.length) return [{ startLine: 1, endLine: raw.split(/\r?\n/).length, text: raw }]
+  const lines = raw.split(/\r?\n/)
+  const chunks: SearchChunk[] = [
+    {
+      heading: "template metadata",
+      startLine: 1,
+      endLine: Math.min(lines.length, 40),
+      text: [
+        `id: ${metadata.id}`,
+        `name: ${metadata.name}`,
+        `severity: ${metadata.severity}`,
+        `tags: ${metadata.tags.join(", ")}`,
+        `cves: ${metadata.cves.join(", ")}`,
+        `description: ${metadata.description}`,
+      ].join("\n"),
+      weightedText: `${metadata.id} ${metadata.name} ${metadata.severity} ${metadata.tags.join(" ")} ${metadata.cves.join(" ")}`,
+    },
+  ]
+  for (let index = 0; index < headings.length; index += 1) {
+    const heading = headings[index]
+    const next = headings[index + 1]
+    const startLine = heading.line
+    const endLine = next ? next.line - 1 : lines.length
+    chunks.push({
+      heading: heading.text,
+      startLine,
+      endLine,
+      text: lines.slice(startLine - 1, endLine).join("\n"),
+      weightedText: heading.text,
+    })
+  }
+  return chunks
+}
+
+function documents(): SearchDocument[] {
+  if (!existsSync(ROOT)) return []
+  if (!documentCache) {
+    documentCache = walkFiles(ROOT, [".yaml", ".yml"]).map((absolutePath) => {
+      const content = readFileSync(absolutePath, "utf8")
+      const relativePath = relative(ROOT, absolutePath).replace(/\\/g, "/")
+      const fallbackId = normalizePathId(relativePath)
+      const metadata = parseMetadata(content, fallbackId)
+      const documentMetadata: DocumentMetadata = {
+        template_id: metadata.id,
+        severity: metadata.severity,
+        tags: metadata.tags,
+        cves: metadata.cves,
+        cwes: metadata.cwes,
+        author: metadata.author,
+        references: metadata.references.length,
+        protocol: relativePath.split("/")[0] ?? "unknown",
+        size_bytes: fileSize(absolutePath),
+      }
+      return {
+        id: metadata.id || fallbackId,
+        title: metadata.name || basename(relativePath),
+        kind: "nuclei-template",
+        absolutePath,
+        relativePath,
+        content,
+        metadata: documentMetadata,
+        headings: topLevelHeadings(content),
+        chunks: topLevelChunks(content, metadata),
+        weightedText: [
+          relativePath,
+          metadata.id,
+          metadata.name,
+          metadata.severity,
+          metadata.tags.join(" "),
+          metadata.cves.join(" "),
+          metadata.cwes.join(" "),
+          metadata.description,
+        ].join(" "),
+      }
+    })
+  }
+  return documentCache
+}
+
+function rootMissingResult(): Record<string, unknown> {
+  return {
+    ok: false,
+    root: ROOT,
+    reason: "nuclei-templates root does not exist. Set NUCLEI_TEMPLATES_ROOT or clone templates at the default path.",
+  }
+}
+
+function setArg(args: Record<string, unknown>, name: string): Set<string> {
+  return new Set(csv(stringArg(args, name)).map((item) => item.toLowerCase()))
+}
+
+const searchTool: McpToolDefinition = {
+  name: "nuclei_search",
+  description:
+    "Search local nuclei-templates with metadata filters and ranked snippets. Use to find exact templates, matchers, CVEs, tags, and protocols before running any scanner.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      query: { type: "string", description: "Technology, CVE, vulnerability class, matcher text, tag, or template id." },
+      limit: { type: "number", description: "Maximum results to return, 1-25. Default: 8." },
+      severity: { type: "string", description: "Optional comma-separated severities, e.g. critical,high." },
+      tags: { type: "string", description: "Optional comma-separated required tags." },
+      cve: { type: "string", description: "Optional CVE id filter, e.g. CVE-2023-1234." },
+      protocol: { type: "string", description: "Optional protocol/path prefix filter, e.g. http, dns, headless." },
+      path_filter: { type: "string", description: "Optional case-insensitive substring filter on template path." },
+      detail: { type: "string", enum: ["compact", "standard", "expanded"], description: "Snippet size/depth. Default: standard." },
+    },
+    required: ["query"],
+  },
+  execute(args) {
+    const docs = documents()
+    if (!docs.length) return rootMissingResult()
+    const severities = setArg(args, "severity")
+    const tags = setArg(args, "tags")
+    const cve = stringArg(args, "cve").toUpperCase()
+    const protocol = stringArg(args, "protocol").toLowerCase()
+    const query = stringArg(args, "query")
+    const detail = stringArg(args, "detail", "standard")
+    const results = searchDocuments(docs, query, {
+      limit: numberArg(args, "limit", 8),
+      pathFilter: stringArg(args, "path_filter"),
+      includeExpandedSnippets: detail === "expanded",
+      filter: (document) => {
+        const severity = String(document.metadata.severity ?? "unknown").toLowerCase()
+        const docTags = Array.isArray(document.metadata.tags) ? document.metadata.tags.map((item) => item.toLowerCase()) : []
+        const docCves = Array.isArray(document.metadata.cves) ? document.metadata.cves.map((item) => item.toUpperCase()) : []
+        const docProtocol = String(document.metadata.protocol ?? "").toLowerCase()
+        if (severities.size && !severities.has(severity)) return false
+        if (tags.size && ![...tags].every((tag) => docTags.includes(tag))) return false
+        if (cve && !docCves.includes(cve)) return false
+        if (protocol && docProtocol !== protocol) return false
+        return true
+      },
+    })
+    return {
+      ok: true,
+      root: ROOT,
+      query,
+      count: results.length,
+      results: results.map(resultSummary),
+      next: "Use nuclei_read with a result id/path before citing or running a template.",
+    }
+  },
+}
+
+const readTool: McpToolDefinition = {
+  name: "nuclei_read",
+  description: "Read a bounded nuclei template by template id/path. Use after nuclei_search to inspect matchers and request details.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      id: { type: "string", description: "Template id, relative path, absolute path, or basename." },
+      max_chars: { type: "number", description: "Maximum characters to return, 500-30000. Default: 12000." },
+      include_outline: { type: "boolean", description: "Include top-level YAML keys in the response. Default: false." },
+    },
+    required: ["id"],
+  },
+  execute(args) {
+    const docs = documents()
+    if (!docs.length) return rootMissingResult()
+    const id = stringArg(args, "id")
+    const document = lookupDocument(docs, id)
+    if (!document) return { ok: false, id, reason: "nuclei template not found." }
+    const selected = boundedContent(document.content, numberArg(args, "max_chars", 12000))
+    return {
+      ok: true,
+      id: document.id,
+      title: document.title,
+      path: document.relativePath,
+      absolute_path: document.absolutePath,
+      metadata: document.metadata,
+      truncated: selected.truncated,
+      outline: booleanArg(args, "include_outline") ? document.headings : undefined,
+      content: selected.content,
+    }
+  },
+}
+
+const statsTool: McpToolDefinition = {
+  name: "nuclei_stats",
+  description: "Return local nuclei-templates corpus stats, severity counts, tag counts, and protocol counts.",
+  inputSchema: { type: "object", properties: {} },
+  execute() {
+    const docs = documents()
+    if (!docs.length) return rootMissingResult()
+    return {
+      ok: true,
+      root: ROOT,
+      templates: docs.length,
+      severities: countByMetadata(docs, "severity"),
+      protocols: countByMetadata(docs, "protocol"),
+      top_tags: Object.fromEntries(Object.entries(countByMetadata(docs, "tags")).slice(0, 40)),
+    }
+  },
+}
+
+startMcpServer({
+  name: "apf-nuclei-templates-mcp",
+  version: VERSION,
+  tools: [searchTool, readTool, statsTool],
+})

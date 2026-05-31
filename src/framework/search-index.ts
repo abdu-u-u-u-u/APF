@@ -1,0 +1,461 @@
+import { createHash } from "node:crypto"
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, appendFileSync } from "node:fs"
+import { dirname, join, relative } from "node:path"
+
+export type SearchSource = "hacktricks" | "nuclei"
+
+export type SearchMode = "first_pass" | "more" | "deeper" | "pivot"
+
+export type SearchRecordStatus = "returned" | "killed" | "promoted" | "blocked" | "watchlist"
+
+export type SearchLedgerRecord = {
+  ts: string
+  query: string
+  result_id: string
+  status: SearchRecordStatus
+  source?: SearchSource
+  note?: string
+  tested_surface?: string
+  killed_reason?: string
+  missing_precondition?: string
+  chain_relevance?: string
+  novelty_cluster?: string
+  next_pivot_query?: string
+}
+
+export type SearchResult = {
+  result_id: string
+  source: SearchSource
+  title: string
+  severity?: string
+  reportability: string
+  path: string
+  heading?: string
+  score: number
+  matched_terms: string[]
+  primitive: string
+  preconditions: string[]
+  safe_next_test: string
+  seen_state: "new" | "seen" | "killed" | "promoted" | "blocked" | "watchlist"
+  snippet: string
+}
+
+type SearchDoc = {
+  source: SearchSource
+  title: string
+  severity?: string
+  path: string
+  heading?: string
+  text: string
+  terms: Map<string, number>
+  totalTerms: number
+  primitive: string
+  preconditions: string[]
+  safeNextTest: string
+}
+
+const DEFAULT_HACKTRICKS_DIR = "/home/sushi/hacktricks"
+const DEFAULT_NUCLEI_DIR = "/home/sushi/nuclei-templates"
+
+const STOP_WORDS = new Set([
+  "the",
+  "and",
+  "for",
+  "with",
+  "this",
+  "that",
+  "from",
+  "into",
+  "via",
+  "are",
+  "you",
+  "your",
+  "can",
+  "will",
+  "should",
+])
+
+const QUERY_EXPANSIONS: Record<string, string[]> = {
+  xss: [
+    "cross site scripting",
+    "dom xss",
+    "innerhtml",
+    "outerhtml",
+    "document write",
+    "location hash",
+    "postmessage",
+    "template injection",
+    "csp bypass",
+    "mutation xss",
+    "mxss",
+    "angular expression",
+    "jquery html",
+    "webview javascript bridge",
+  ],
+  idor: ["bola", "object authorization", "tenant", "account id", "resource id", "uuid", "cross account"],
+  bola: ["idor", "broken object level authorization", "object authorization", "tenant", "resource id"],
+  oauth: ["oidc", "redirect uri", "state", "pkce", "code replay", "client id", "callback"],
+  jwt: ["jwk", "jku", "kid", "alg none", "hs256", "rs256", "key confusion", "token"],
+  cors: ["origin reflection", "credentials", "null origin", "acao", "acac", "preflight"],
+  webview: ["android", "deeplink", "intent", "loadurl", "addjavascriptinterface", "javascript bridge"],
+  deeplink: ["android", "intent", "custom scheme", "universal link", "app link", "webview"],
+  "403": ["bypass", "xff", "x original url", "rewrite url", "dot segment", "path normalization"],
+  cache: ["web cache deception", "cache poisoning", "cdn", "cloudflare", "delimiter", "static extension"],
+  socket: ["socketio", "websocket", "namespace", "ack", "event", "origin", "csrf"],
+}
+
+let hacktricksIndex: SearchDoc[] | null = null
+let nucleiIndex: SearchDoc[] | null = null
+let docFreqs: Map<string, number> | null = null
+
+function hacktricksDir(): string {
+  return process.env.APF_HACKTRICKS_DIR ?? process.env.MDASH_HACKTRICKS_DIR ?? DEFAULT_HACKTRICKS_DIR
+}
+
+function nucleiDir(): string {
+  return process.env.APF_NUCLEI_DIR ?? process.env.MDASH_NUCLEI_DIR ?? DEFAULT_NUCLEI_DIR
+}
+
+export function resetSearchIndexesForTest(): void {
+  hacktricksIndex = null
+  nucleiIndex = null
+  docFreqs = null
+}
+
+export function searchReferenceRoots(): Record<SearchSource, { path: string; exists: boolean }> {
+  const hacktricks = hacktricksDir()
+  const nuclei = nucleiDir()
+  return {
+    hacktricks: { path: hacktricks, exists: existsSync(hacktricks) },
+    nuclei: { path: nuclei, exists: existsSync(nuclei) },
+  }
+}
+
+export function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9_\-\s./:]+/g, " ")
+    .split(/[\s_\-./:]+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length > 2 && !STOP_WORDS.has(token))
+}
+
+export function expandQuery(query: string, mode: SearchMode): string {
+  const baseTokens = tokenize(query)
+  const expansions = new Set<string>()
+  for (const token of baseTokens) {
+    expansions.add(token)
+    for (const expanded of QUERY_EXPANSIONS[token] ?? []) {
+      for (const expandedToken of tokenize(expanded)) expansions.add(expandedToken)
+    }
+  }
+  if (mode === "pivot") {
+    for (const token of ["variant", "bypass", "edge", "trust", "boundary", "misconfiguration", "sink"]) {
+      expansions.add(token)
+    }
+  }
+  if (mode === "deeper") {
+    for (const token of ["precondition", "sink", "source", "matcher", "payload", "proof"]) {
+      expansions.add(token)
+    }
+  }
+  return [...expansions].join(" ")
+}
+
+function walkFiles(root: string, extensions: Set<string>, maxFiles = 30000): string[] {
+  const results: string[] = []
+  const walk = (dir: string): void => {
+    if (results.length >= maxFiles) return
+    let entries: string[]
+    try {
+      entries = readdirSync(dir)
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (entry === ".git" || entry === "node_modules" || entry === "dist") continue
+      const path = join(dir, entry)
+      let stat
+      try {
+        stat = statSync(path)
+      } catch {
+        continue
+      }
+      if (stat.isDirectory()) {
+        walk(path)
+      } else if (extensions.has(entry.toLowerCase().split(".").pop() ?? "")) {
+        results.push(path)
+      }
+    }
+  }
+  if (existsSync(root)) walk(root)
+  return results
+}
+
+function termMap(text: string, boosts: string[] = []): { terms: Map<string, number>; totalTerms: number } {
+  const terms = new Map<string, number>()
+  let totalTerms = 0
+  for (const token of tokenize(text)) {
+    terms.set(token, (terms.get(token) ?? 0) + 1)
+    totalTerms += 1
+  }
+  for (const boost of boosts) {
+    for (const token of tokenize(boost)) {
+      terms.set(token, (terms.get(token) ?? 0) + 12)
+      totalTerms += 12
+    }
+  }
+  return { terms, totalTerms: Math.max(totalTerms, 1) }
+}
+
+function inferPrimitive(text: string, fallback: string): string {
+  const lowered = text.toLowerCase()
+  if (lowered.includes("loadurl") || lowered.includes("addjavascriptinterface")) return "attacker-controlled route or intent reaches a WebView sink"
+  if (lowered.includes("redirect_uri") || lowered.includes("pkce")) return "OAuth/OIDC state, redirect, or code-exchange trust boundary"
+  if (lowered.includes("x-forwarded") || lowered.includes("x-original-url")) return "proxy/header trust bypass against a protected path"
+  if (lowered.includes("innerhtml") || lowered.includes("document.write") || lowered.includes("xss")) return "attacker-controlled text reaches a browser script or HTML sink"
+  if (lowered.includes("idor") || lowered.includes("bola")) return "object identifier crosses an authorization boundary"
+  if (lowered.includes("jwt") || lowered.includes("kid") || lowered.includes("jwk")) return "token signature, claim, or key-selection trust boundary"
+  if (lowered.includes("cache")) return "CDN/origin cache key mismatch exposes or poisons content"
+  return fallback
+}
+
+function inferPreconditions(text: string): string[] {
+  const lowered = text.toLowerCase()
+  const preconditions: string[] = []
+  if (lowered.includes("xss")) preconditions.push("target exposes attacker-controlled input that reaches a browser-rendered sink")
+  if (lowered.includes("webview")) preconditions.push("attacker-controlled URL, intent extra, or deeplink reaches WebView behavior")
+  if (lowered.includes("oauth") || lowered.includes("redirect_uri")) preconditions.push("owned login flow exposes authorize/callback/token behavior")
+  if (lowered.includes("403") || lowered.includes("x-forwarded")) preconditions.push("protected path has a baseline denied response and proxy/header variants are in scope")
+  if (lowered.includes("jwt")) preconditions.push("a replayable token and accepting endpoint are available")
+  if (lowered.includes("idor") || lowered.includes("bola")) preconditions.push("two owned objects or accounts exist for differential authorization checks")
+  if (preconditions.length === 0) preconditions.push("target evidence must match the reference preconditions before testing")
+  return preconditions.slice(0, 4)
+}
+
+function safeNextTest(text: string): string {
+  const lowered = text.toLowerCase()
+  if (lowered.includes("webview") || lowered.includes("intent")) return "Map exported components, consumed extras, and sink reachability before any dynamic launch"
+  if (lowered.includes("xss")) return "Search target HTML/JS for matching sinks and prove reflection/reachability before payload testing"
+  if (lowered.includes("oauth") || lowered.includes("redirect_uri")) return "Capture an owned browser auth flow and test state/redirect/PKCE validation with no account linking side effects"
+  if (lowered.includes("jwt")) return "Check token header/claim handling against an owned endpoint and avoid brute force unless explicitly authorized"
+  if (lowered.includes("403") || lowered.includes("x-forwarded")) return "Run one low-rate differential request against an in-scope denied path and compare status/body/source boundary"
+  return "Compare target evidence to reference preconditions, then design the smallest reversible owned-account check"
+}
+
+function reportabilityForSeverity(severity: string | undefined): string {
+  const normalized = severity?.trim().toLowerCase()
+  if (!normalized) return "reference_only_target_impact_required"
+  if (normalized === "high" || normalized === "critical") return "accepted_severity_if_target_high_critical_impact_is_confirmed"
+  if (normalized === "info" || normalized === "informational" || normalized === "low" || normalized === "medium") {
+    return "not_accepted_standalone_chain_component_only"
+  }
+  return "unknown_severity_target_impact_required"
+}
+
+function buildHacktricksIndex(): SearchDoc[] {
+  if (hacktricksIndex) return hacktricksIndex
+  const docs: SearchDoc[] = []
+  const root = hacktricksDir()
+  for (const file of walkFiles(root, new Set(["md"]))) {
+    let raw: string
+    try {
+      raw = readFileSync(file, "utf8")
+    } catch {
+      continue
+    }
+    const title = raw.match(/^#\s+(.+)$/m)?.[1]?.trim() ?? relative(root, file)
+    const chunks = raw.split(/\n(?=#{1,4}\s+)/g)
+    for (const chunk of chunks) {
+      const heading = chunk.match(/^#{1,4}\s+(.+)$/m)?.[1]?.trim()
+      const text = chunk.length > 250 ? chunk : raw.slice(0, 2500)
+      const { terms, totalTerms } = termMap(text, [title, heading ?? ""])
+      docs.push({
+        source: "hacktricks",
+        title,
+        heading,
+        path: file,
+        text,
+        terms,
+        totalTerms,
+        primitive: inferPrimitive(text, "methodology/reference primitive"),
+        preconditions: inferPreconditions(text),
+        safeNextTest: safeNextTest(text),
+      })
+    }
+  }
+  hacktricksIndex = docs
+  return docs
+}
+
+function yamlValue(raw: string, key: string): string {
+  return raw.match(new RegExp(`^\\s*${key}:\\s*["']?([^"'\n]+)`, "im"))?.[1]?.trim() ?? ""
+}
+
+function buildNucleiIndex(): SearchDoc[] {
+  if (nucleiIndex) return nucleiIndex
+  const docs: SearchDoc[] = []
+  const root = nucleiDir()
+  for (const file of walkFiles(root, new Set(["yaml", "yml"]))) {
+    let raw: string
+    try {
+      raw = readFileSync(file, "utf8")
+    } catch {
+      continue
+    }
+    const id = yamlValue(raw, "id") || relative(root, file).replace(/\.(ya?ml)$/i, "")
+    const name = yamlValue(raw, "name") || id
+    const severity = yamlValue(raw, "severity") || "info"
+    const tags = yamlValue(raw, "tags")
+    const title = `${id} (${severity})`
+    const text = `${id}\n${name}\n${severity}\n${tags}\n${raw}`
+    const { terms, totalTerms } = termMap(text, [id, name, tags, severity])
+    docs.push({
+      source: "nuclei",
+      title,
+      severity,
+      path: file,
+      text,
+      terms,
+      totalTerms,
+      primitive: inferPrimitive(text, "nuclei matcher or payload reference"),
+      preconditions: inferPreconditions(text),
+      safeNextTest: safeNextTest(text),
+    })
+  }
+  nucleiIndex = docs
+  return docs
+}
+
+function getDocFreqs(docs: SearchDoc[]): Map<string, number> {
+  const freqs = new Map<string, number>()
+  for (const doc of docs) {
+    for (const term of doc.terms.keys()) {
+      freqs.set(term, (freqs.get(term) ?? 0) + 1)
+    }
+  }
+  return freqs
+}
+
+function resultId(doc: SearchDoc): string {
+  const hash = createHash("sha1").update(`${doc.source}\n${doc.path}\n${doc.heading ?? ""}`).digest("hex").slice(0, 12)
+  return `${doc.source}:${hash}`
+}
+
+export function ledgerPath(directory: string): string {
+  return join(directory, "framework", "search-ledger.jsonl")
+}
+
+export function readSearchLedger(directory: string): SearchLedgerRecord[] {
+  const file = ledgerPath(directory)
+  if (!existsSync(file)) return []
+  const lines = readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean)
+  const records: SearchLedgerRecord[] = []
+  for (const line of lines) {
+    try {
+      records.push(JSON.parse(line) as SearchLedgerRecord)
+    } catch {
+      // Ignore malformed historical lines.
+    }
+  }
+  return records
+}
+
+export function appendSearchLedger(directory: string, records: SearchLedgerRecord[]): void {
+  const file = ledgerPath(directory)
+  mkdirSync(dirname(file), { recursive: true })
+  appendFileSync(file, records.map((record) => JSON.stringify(record)).join("\n") + "\n")
+}
+
+export function searchReferences(args: {
+  directory: string
+  query: string
+  mode: SearchMode
+  sources?: SearchSource[]
+  limit: number
+  includeSeen?: boolean
+  avoid?: string[]
+}): { expanded_query: string; results: SearchResult[]; ledger_counts: Record<string, number> } {
+  const sources = new Set(args.sources ?? ["hacktricks", "nuclei"])
+  const docs = [
+    ...(sources.has("hacktricks") ? buildHacktricksIndex() : []),
+    ...(sources.has("nuclei") ? buildNucleiIndex() : []),
+  ]
+  docFreqs = getDocFreqs(docs)
+  const expanded = expandQuery(args.query, args.mode)
+  const queryTokens = tokenize(expanded)
+  const ledger = readSearchLedger(args.directory)
+  const latestStatus = new Map<string, SearchRecordStatus>()
+  const counts: Record<string, number> = {}
+  for (const record of ledger) {
+    latestStatus.set(record.result_id, record.status)
+    counts[record.status] = (counts[record.status] ?? 0) + 1
+  }
+  const avoid = new Set(args.avoid ?? [])
+
+  const scored: SearchResult[] = []
+  for (const doc of docs) {
+    let score = 0
+    const matched = new Set<string>()
+    for (const token of queryTokens) {
+      let tf = doc.terms.get(token) ?? 0
+      if (tf === 0) {
+        for (const [term, value] of doc.terms) {
+          if (term.includes(token) || token.includes(term)) tf += value * 0.25
+        }
+      }
+      if (tf > 0) {
+        const df = docFreqs.get(token) ?? 1
+        score += (tf / doc.totalTerms) * Math.log((docs.length + 1) / df)
+        matched.add(token)
+      }
+    }
+    if (score <= 0) continue
+    const id = resultId(doc)
+    const status = latestStatus.get(id)
+    if (avoid.has(id)) continue
+    if (!args.includeSeen && status && status !== "watchlist") continue
+    if (status === "killed") score *= 0.05
+    if (status === "returned") score *= 0.35
+    const seenState = status === "returned" ? "seen" : (status ?? "new")
+    scored.push({
+      result_id: id,
+      source: doc.source,
+      title: doc.title,
+      severity: doc.severity,
+      reportability: reportabilityForSeverity(doc.severity),
+      path: doc.path,
+      heading: doc.heading,
+      score,
+      matched_terms: [...matched],
+      primitive: doc.primitive,
+      preconditions: doc.preconditions,
+      safe_next_test: doc.safeNextTest,
+      seen_state: seenState,
+      snippet: doc.text.replace(/\s+/g, " ").slice(0, 420),
+    })
+  }
+
+  const diversified: SearchResult[] = []
+  const usedPaths = new Set<string>()
+  for (const result of scored.sort((a, b) => b.score - a.score)) {
+    const pathKey = `${result.source}:${result.path}`
+    if (usedPaths.has(pathKey) && diversified.length < args.limit) continue
+    diversified.push(result)
+    usedPaths.add(pathKey)
+    if (diversified.length >= args.limit) break
+  }
+  if (diversified.length < args.limit) {
+    for (const result of scored.sort((a, b) => b.score - a.score)) {
+      if (diversified.some((existing) => existing.result_id === result.result_id)) continue
+      diversified.push(result)
+      if (diversified.length >= args.limit) break
+    }
+  }
+
+  return {
+    expanded_query: expanded,
+    results: diversified,
+    ledger_counts: counts,
+  }
+}

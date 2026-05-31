@@ -1,0 +1,260 @@
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { dirname, join } from "node:path"
+
+export const FRAMEWORK_PATH_STATES = [
+  "not_started",
+  "active",
+  "sampled_no_hit",
+  "killed",
+  "chain_component",
+  "candidate",
+  "needs_browser_capture",
+  "needs_har_trace",
+  "needs_ab_test",
+  "blocked_auth",
+  "blocked_proxy",
+  "blocked_scope",
+  "blocked_tooling",
+  "exhausted",
+  "report_ready",
+] as const
+
+export type FrameworkPathState = (typeof FRAMEWORK_PATH_STATES)[number]
+
+export type FrameworkLaneState = {
+  state: FrameworkPathState
+  confidence?: "low" | "medium" | "high"
+  reason?: string
+  next_action?: string
+  evidence?: string[]
+  children?: Record<string, FrameworkLaneState>
+}
+
+export type FrameworkFindingState = {
+  id: string
+  title: string
+  state: "candidate" | "needs_proof" | "report_ready" | "reported" | "killed"
+  severity?: "informational" | "low" | "medium" | "high" | "critical"
+  summary?: string
+  evidence?: string[]
+  next_action?: string
+  updated_at: string
+}
+
+export type FrameworkState = {
+  schema: "abdus-pentest-framework.state.v1"
+  status: "initialized" | "active" | "blocked" | "complete"
+  created_at: string
+  updated_at: string
+  single_ai: {
+    agent: "pentester"
+    no_subagents: boolean
+    no_judge_workflow: true
+  }
+  target: {
+    name?: string
+    scope_summary?: string
+    authorization?: "unknown" | "confirmed" | "blocked" | "out_of_scope"
+    notes?: string
+  }
+  current_focus?: string
+  next_actions: string[]
+  lanes: Record<string, FrameworkLaneState>
+  findings: Record<string, FrameworkFindingState>
+}
+
+export function timestamp(): string {
+  return new Date().toISOString()
+}
+
+export function defaultFrameworkState(now = timestamp()): FrameworkState {
+  return {
+    schema: "abdus-pentest-framework.state.v1",
+    status: "initialized",
+    created_at: now,
+    updated_at: now,
+    single_ai: {
+      agent: "pentester",
+      no_subagents: false,
+      no_judge_workflow: true,
+    },
+    target: {
+      authorization: "unknown",
+    },
+    next_actions: [
+      "Run framework_init, ingest program scope, then keep framework/state.json and framework/status.md current as work proceeds.",
+    ],
+    lanes: {
+      scope: { state: "not_started" },
+      web_api: { state: "not_started" },
+      browser: { state: "not_started" },
+      mobile: { state: "not_started" },
+      repo: { state: "not_started" },
+      intel: { state: "not_started" },
+      auth: { state: "not_started" },
+    },
+    findings: {},
+  }
+}
+
+export function frameworkStatePath(directory: string): string {
+  return join(directory, "framework", "state.json")
+}
+
+export function isFrameworkPathState(value: unknown): value is FrameworkPathState {
+  return typeof value === "string" && (FRAMEWORK_PATH_STATES as readonly string[]).includes(value)
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return [
+    ...new Set(value.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map((item) => item.trim())),
+  ]
+}
+
+function normalizeLane(value: unknown): FrameworkLaneState {
+  if (typeof value === "string") {
+    return { state: isFrameworkPathState(value) ? value : value === "blocked" ? "blocked_tooling" : "active" }
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return { state: "not_started" }
+  }
+  const record = value as Record<string, unknown>
+  const lane: FrameworkLaneState = {
+    state: isFrameworkPathState(record.state) ? record.state : "not_started",
+  }
+  if (typeof record.confidence === "string" && ["low", "medium", "high"].includes(record.confidence)) {
+    lane.confidence = record.confidence as FrameworkLaneState["confidence"]
+  }
+  if (typeof record.reason === "string") lane.reason = record.reason
+  if (typeof record.next_action === "string") lane.next_action = record.next_action
+  if (Array.isArray(record.evidence)) lane.evidence = stringArray(record.evidence)
+  if (record.children && typeof record.children === "object" && !Array.isArray(record.children)) {
+    lane.children = Object.fromEntries(
+      Object.entries(record.children as Record<string, unknown>).map(([key, child]) => [key, normalizeLane(child)]),
+    )
+  }
+  return lane
+}
+
+function normalizeFinding(value: unknown): FrameworkFindingState | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined
+  const record = value as Record<string, unknown>
+  if (typeof record.id !== "string" || typeof record.title !== "string") return undefined
+  const state =
+    record.state === "candidate" ||
+    record.state === "needs_proof" ||
+    record.state === "report_ready" ||
+    record.state === "reported" ||
+    record.state === "killed"
+      ? record.state
+      : "candidate"
+  return {
+    id: record.id,
+    title: record.title,
+    state,
+    severity:
+      record.severity === "informational" ||
+      record.severity === "low" ||
+      record.severity === "medium" ||
+      record.severity === "high" ||
+      record.severity === "critical"
+        ? record.severity
+        : undefined,
+    summary: typeof record.summary === "string" ? record.summary : undefined,
+    evidence: stringArray(record.evidence),
+    next_action: typeof record.next_action === "string" ? record.next_action : undefined,
+    updated_at: typeof record.updated_at === "string" ? record.updated_at : timestamp(),
+  }
+}
+
+export function normalizeFrameworkState(raw: unknown): FrameworkState {
+  const base = defaultFrameworkState()
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return base
+  const record = raw as Record<string, unknown>
+  const lanes =
+    record.lanes && typeof record.lanes === "object" && !Array.isArray(record.lanes)
+      ? { ...base.lanes, ...Object.fromEntries(Object.entries(record.lanes as Record<string, unknown>).map(([key, value]) => [key, normalizeLane(value)])) }
+      : base.lanes
+  const findings =
+    record.findings && typeof record.findings === "object" && !Array.isArray(record.findings)
+      ? Object.fromEntries(
+          Object.entries(record.findings as Record<string, unknown>)
+            .map(([key, value]) => [key, normalizeFinding(value)])
+            .filter((entry): entry is [string, FrameworkFindingState] => Boolean(entry[1])),
+        )
+      : {}
+  const targetRecord =
+    record.target && typeof record.target === "object" && !Array.isArray(record.target) ? (record.target as Record<string, unknown>) : {}
+  return {
+    ...base,
+    status:
+      record.status === "active" || record.status === "blocked" || record.status === "complete" || record.status === "initialized"
+        ? record.status
+        : base.status,
+    created_at: typeof record.created_at === "string" ? record.created_at : base.created_at,
+    updated_at: typeof record.updated_at === "string" ? record.updated_at : base.updated_at,
+    target: {
+      name: typeof targetRecord.name === "string" ? targetRecord.name : undefined,
+      scope_summary: typeof targetRecord.scope_summary === "string" ? targetRecord.scope_summary : undefined,
+      authorization:
+        targetRecord.authorization === "confirmed" ||
+        targetRecord.authorization === "blocked" ||
+        targetRecord.authorization === "out_of_scope" ||
+        targetRecord.authorization === "unknown"
+          ? targetRecord.authorization
+          : "unknown",
+      notes: typeof targetRecord.notes === "string" ? targetRecord.notes : undefined,
+    },
+    current_focus: typeof record.current_focus === "string" ? record.current_focus : undefined,
+    next_actions: stringArray(record.next_actions).length ? stringArray(record.next_actions) : base.next_actions,
+    lanes,
+    findings,
+    single_ai: base.single_ai,
+    schema: base.schema,
+  }
+}
+
+export function readFrameworkState(directory: string): FrameworkState {
+  const file = frameworkStatePath(directory)
+  if (!existsSync(file)) return defaultFrameworkState()
+  try {
+    return normalizeFrameworkState(JSON.parse(readFileSync(file, "utf8")))
+  } catch {
+    return defaultFrameworkState()
+  }
+}
+
+export function writeFrameworkState(directory: string, state: FrameworkState): void {
+  const file = frameworkStatePath(directory)
+  mkdirSync(dirname(file), { recursive: true })
+  writeFileSync(file, `${JSON.stringify(normalizeFrameworkState({ ...state, updated_at: timestamp() }), null, 2)}\n`)
+}
+
+export function laneHasUnresolvedChild(lane: FrameworkLaneState): boolean {
+  const unresolved = new Set<FrameworkPathState>([
+    "active",
+    "sampled_no_hit",
+    "chain_component",
+    "needs_browser_capture",
+    "needs_har_trace",
+    "needs_ab_test",
+    "blocked_auth",
+    "blocked_proxy",
+    "blocked_tooling",
+  ])
+  if (lane.children) {
+    return Object.values(lane.children).some((child) => unresolved.has(child.state) || laneHasUnresolvedChild(child))
+  }
+  return false
+}
+
+export function validateExhaustion(state: FrameworkState): string[] {
+  const problems: string[] = []
+  for (const [laneName, lane] of Object.entries(state.lanes)) {
+    if (lane.state === "exhausted" && laneHasUnresolvedChild(lane)) {
+      problems.push(`${laneName} is exhausted but has unresolved child paths`)
+    }
+  }
+  return problems
+}

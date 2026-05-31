@@ -1,0 +1,405 @@
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs"
+import { basename, extname, join, relative } from "node:path"
+
+export type DocumentMetadata = Record<string, string | string[] | number | boolean | undefined>
+
+export type DocumentHeading = {
+  level: number
+  text: string
+  line: number
+}
+
+export type SearchChunk = {
+  heading?: string
+  startLine: number
+  endLine: number
+  text: string
+  weightedText?: string
+}
+
+export type SearchDocument = {
+  id: string
+  title: string
+  kind: string
+  absolutePath: string
+  relativePath: string
+  content: string
+  metadata: DocumentMetadata
+  headings: DocumentHeading[]
+  chunks: SearchChunk[]
+  weightedText?: string
+}
+
+export type SearchResult = {
+  document: SearchDocument
+  score: number
+  snippets: Array<{
+    heading?: string
+    lines: string
+    text: string
+  }>
+}
+
+export type SearchOptions = {
+  limit?: number
+  pathFilter?: string
+  filter?: (document: SearchDocument) => boolean
+  includeExpandedSnippets?: boolean
+}
+
+type PreparedChunk = SearchChunk & {
+  tokenCounts: Map<string, number>
+}
+
+type PreparedDocument = SearchDocument & {
+  tokenCounts: Map<string, number>
+  preparedChunks: PreparedChunk[]
+}
+
+const DEFAULT_IGNORES = new Set([".git", "node_modules", ".venv", "__pycache__", ".cache"])
+const MAX_CHUNK_CHARS = 2800
+const CHUNK_OVERLAP_LINES = 4
+
+export function normalizePathId(value: string): string {
+  return value.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\.(md|markdown|ya?ml)$/i, "")
+}
+
+export function tokenize(input: string): string[] {
+  const normalized = input
+    .toLowerCase()
+    .replace(/&[a-z]+;/g, " ")
+    .replace(/[^a-z0-9+_.:/#-]+/g, " ")
+  const tokens = normalized.match(/[a-z0-9][a-z0-9+_.:/#-]*/g) ?? []
+  const expanded: string[] = []
+  for (const token of tokens) {
+    if (token.length < 2) continue
+    expanded.push(token)
+    for (const part of token.split(/[-_:/#.]+/)) {
+      if (part.length >= 2 && part !== token) expanded.push(part)
+    }
+  }
+  return expanded
+}
+
+export function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values)]
+}
+
+export function walkFiles(root: string, extensions: string[], ignored = DEFAULT_IGNORES): string[] {
+  if (!existsSync(root)) return []
+  const wanted = new Set(extensions.map((item) => item.toLowerCase()))
+  const files: string[] = []
+
+  function visit(directory: string): void {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (entry.isDirectory()) {
+        if (!ignored.has(entry.name)) visit(join(directory, entry.name))
+        continue
+      }
+      if (!entry.isFile()) continue
+      if (wanted.has(extname(entry.name).toLowerCase())) files.push(join(directory, entry.name))
+    }
+  }
+
+  visit(root)
+  return files.sort()
+}
+
+function tokenCounts(text: string): Map<string, number> {
+  const counts = new Map<string, number>()
+  for (const token of tokenize(text)) {
+    counts.set(token, (counts.get(token) ?? 0) + 1)
+  }
+  return counts
+}
+
+function metadataText(metadata: DocumentMetadata): string {
+  return Object.entries(metadata)
+    .flatMap(([key, value]) => {
+      if (Array.isArray(value)) return [key, ...value]
+      if (value === undefined) return [key]
+      return [key, String(value)]
+    })
+    .join(" ")
+}
+
+function prepareDocuments(documents: SearchDocument[]): PreparedDocument[] {
+  return documents.map((document) => {
+    const docWeightedText = [
+      document.title,
+      document.relativePath,
+      document.kind,
+      metadataText(document.metadata),
+      document.weightedText ?? "",
+    ].join(" ")
+    return {
+      ...document,
+      tokenCounts: tokenCounts(`${docWeightedText} ${docWeightedText} ${document.content.slice(0, 12000)}`),
+      preparedChunks: document.chunks.map((chunk) => ({
+        ...chunk,
+        tokenCounts: tokenCounts([chunk.heading ?? "", chunk.weightedText ?? "", chunk.text].join(" ")),
+      })),
+    }
+  })
+}
+
+function documentFrequency(documents: PreparedDocument[]): Map<string, number> {
+  const frequency = new Map<string, number>()
+  for (const document of documents) {
+    const seen = new Set<string>()
+    for (const token of document.tokenCounts.keys()) seen.add(token)
+    for (const chunk of document.preparedChunks) {
+      for (const token of chunk.tokenCounts.keys()) seen.add(token)
+    }
+    for (const token of seen) frequency.set(token, (frequency.get(token) ?? 0) + 1)
+  }
+  return frequency
+}
+
+function scoreCounts(
+  counts: Map<string, number>,
+  queryTokens: string[],
+  frequency: Map<string, number>,
+  documentCount: number,
+): number {
+  let score = 0
+  for (const token of queryTokens) {
+    const exact = counts.get(token) ?? 0
+    const df = frequency.get(token) ?? 0
+    const idf = Math.log(1 + documentCount / (1 + df))
+    if (exact > 0) score += (1 + Math.log(exact)) * (1 + idf)
+    if (exact === 0 && token.length >= 4) {
+      for (const [candidate, count] of counts.entries()) {
+        if (candidate.includes(token) || token.includes(candidate)) {
+          score += Math.min(count, 3) * 0.18
+        }
+      }
+    }
+  }
+  return score
+}
+
+function phraseBoost(text: string, query: string): number {
+  const q = query.trim().toLowerCase()
+  if (q.length < 4) return 0
+  return text.toLowerCase().includes(q) ? Math.min(6, q.split(/\s+/).length * 1.5) : 0
+}
+
+function trimSnippet(text: string, queryTokens: string[], expanded: boolean): string {
+  const cleaned = text
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim()
+  if (!cleaned) return ""
+  const lower = cleaned.toLowerCase()
+  const hit = queryTokens.map((token) => lower.indexOf(token)).filter((index) => index >= 0).sort((a, b) => a - b)[0] ?? 0
+  const maxChars = expanded ? 900 : 430
+  const start = Math.max(0, hit - Math.floor(maxChars * 0.35))
+  const snippet = cleaned.slice(start, start + maxChars)
+  return `${start > 0 ? "..." : ""}${snippet}${start + maxChars < cleaned.length ? "..." : ""}`
+}
+
+export function searchDocuments(documents: SearchDocument[], query: string, options: SearchOptions = {}): SearchResult[] {
+  const queryTokens = uniqueStrings(tokenize(query))
+  const pathFilter = options.pathFilter?.toLowerCase()
+  const prepared = prepareDocuments(
+    documents.filter((document) => {
+      if (pathFilter && !document.relativePath.toLowerCase().includes(pathFilter)) return false
+      return options.filter ? options.filter(document) : true
+    }),
+  )
+  if (prepared.length === 0) return []
+  const frequency = documentFrequency(prepared)
+  const limit = Math.max(1, Math.min(options.limit ?? 8, 25))
+
+  const results = prepared
+    .map((document) => {
+      const docText = [document.title, document.relativePath, metadataText(document.metadata), document.weightedText ?? ""].join(" ")
+      const docScore =
+        scoreCounts(document.tokenCounts, queryTokens, frequency, prepared.length) * 1.3 +
+        phraseBoost(docText, query) +
+        (queryTokens.some((token) => document.title.toLowerCase().includes(token)) ? 2.5 : 0) +
+        (queryTokens.some((token) => document.relativePath.toLowerCase().includes(token)) ? 1.8 : 0)
+
+      const rankedChunks = document.preparedChunks
+        .map((chunk) => ({
+          chunk,
+          score:
+            scoreCounts(chunk.tokenCounts, queryTokens, frequency, prepared.length) +
+            phraseBoost(`${chunk.heading ?? ""} ${chunk.text}`, query),
+        }))
+        .filter((item) => item.score > 0)
+        .sort((left, right) => right.score - left.score)
+        .slice(0, options.includeExpandedSnippets ? 5 : 3)
+
+      const bestChunkScore = rankedChunks[0]?.score ?? 0
+      const score = docScore + bestChunkScore * 1.7
+      const snippets = rankedChunks.map(({ chunk }) => ({
+        heading: chunk.heading,
+        lines: `${chunk.startLine}-${chunk.endLine}`,
+        text: trimSnippet(chunk.text, queryTokens, options.includeExpandedSnippets ?? false),
+      }))
+      return { document, score, snippets }
+    })
+    .filter((item) => item.score > 0 || queryTokens.length === 0)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, limit)
+
+  return results
+}
+
+export function lookupDocument(documents: SearchDocument[], idOrPath: string): SearchDocument | undefined {
+  const wanted = normalizePathId(idOrPath).toLowerCase()
+  return documents.find((document) => {
+    const candidates = [
+      document.id,
+      document.relativePath,
+      normalizePathId(document.relativePath),
+      document.absolutePath,
+      basename(document.relativePath),
+      normalizePathId(basename(document.relativePath)),
+    ]
+    return candidates.some((candidate) => normalizePathId(candidate).toLowerCase() === wanted)
+  })
+}
+
+function lineNumberForOffset(content: string, offset: number): number {
+  return content.slice(0, offset).split(/\r?\n/).length
+}
+
+function splitLargeText(text: string, startLine: number, heading?: string, weightedText?: string): SearchChunk[] {
+  if (text.length <= MAX_CHUNK_CHARS) {
+    const lineCount = text.split(/\r?\n/).length
+    return [{ heading, startLine, endLine: startLine + lineCount - 1, text, weightedText }]
+  }
+
+  const lines = text.split(/\r?\n/)
+  const chunks: SearchChunk[] = []
+  let index = 0
+  while (index < lines.length) {
+    let end = index
+    let chars = 0
+    while (end < lines.length && chars < MAX_CHUNK_CHARS) {
+      chars += lines[end].length + 1
+      end += 1
+    }
+    const chunkLines = lines.slice(index, end)
+    chunks.push({
+      heading,
+      startLine: startLine + index,
+      endLine: startLine + end - 1,
+      text: chunkLines.join("\n"),
+      weightedText,
+    })
+    if (end >= lines.length) break
+    index = Math.max(index + 1, end - CHUNK_OVERLAP_LINES)
+  }
+  return chunks
+}
+
+export function markdownHeadings(content: string): DocumentHeading[] {
+  const headings: DocumentHeading[] = []
+  const lines = content.split(/\r?\n/)
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = lines[index].match(/^(#{1,6})\s+(.+?)\s*#*\s*$/)
+    if (match) headings.push({ level: match[1].length, text: match[2].trim(), line: index + 1 })
+  }
+  return headings
+}
+
+export function markdownTitle(content: string, fallback: string): string {
+  return markdownHeadings(content).find((heading) => heading.level === 1)?.text ?? fallback
+}
+
+export function markdownChunks(content: string): SearchChunk[] {
+  const headings = markdownHeadings(content)
+  if (headings.length === 0) return splitLargeText(content, 1)
+  const chunks: SearchChunk[] = []
+  const stack: DocumentHeading[] = []
+
+  for (let index = 0; index < headings.length; index += 1) {
+    const heading = headings[index]
+    while (stack.length && stack[stack.length - 1].level >= heading.level) stack.pop()
+    stack.push(heading)
+    const next = headings[index + 1]
+    const startOffset = content.split(/\r?\n/).slice(0, heading.line - 1).join("\n").length
+    const startLine = heading.line
+    const endLine = next ? next.line - 1 : content.split(/\r?\n/).length
+    const sectionText = content
+      .split(/\r?\n/)
+      .slice(startLine - 1, endLine)
+      .join("\n")
+    const headingPath = stack.map((item) => item.text).join(" > ")
+    chunks.push(...splitLargeText(sectionText, lineNumberForOffset(content, Math.max(0, startOffset)), headingPath, headingPath))
+  }
+  return chunks
+}
+
+export function buildMarkdownDocuments(root: string, kind: string): SearchDocument[] {
+  return walkFiles(root, [".md", ".markdown"]).map((absolutePath) => {
+    const content = readFileSync(absolutePath, "utf8")
+    const relativePath = relative(root, absolutePath).replace(/\\/g, "/")
+    const fallbackTitle = basename(relativePath).replace(/\.(md|markdown)$/i, "")
+    return {
+      id: normalizePathId(relativePath),
+      title: markdownTitle(content, fallbackTitle),
+      kind,
+      absolutePath,
+      relativePath,
+      content,
+      metadata: {},
+      headings: markdownHeadings(content),
+      chunks: markdownChunks(content),
+      weightedText: relativePath,
+    }
+  })
+}
+
+export function boundedContent(content: string, maxChars: number, heading?: string): { content: string; truncated: boolean } {
+  let selected = content
+  if (heading) {
+    const headings = markdownHeadings(content)
+    const wanted = heading.toLowerCase()
+    const found = headings.find((item) => item.text.toLowerCase().includes(wanted))
+    if (found) {
+      const next = headings.find((item) => item.line > found.line && item.level <= found.level)
+      selected = content
+        .split(/\r?\n/)
+        .slice(found.line - 1, next ? next.line - 1 : undefined)
+        .join("\n")
+    }
+  }
+  const limit = Math.max(500, Math.min(maxChars, 30000))
+  return { content: selected.slice(0, limit), truncated: selected.length > limit }
+}
+
+export function fileSize(path: string): number {
+  try {
+    return statSync(path).size
+  } catch {
+    return 0
+  }
+}
+
+export function countByMetadata(documents: SearchDocument[], key: string): Record<string, number> {
+  const counts: Record<string, number> = {}
+  for (const document of documents) {
+    const value = document.metadata[key]
+    const values = Array.isArray(value) ? value : value === undefined ? ["unknown"] : [String(value)]
+    for (const item of values) counts[item] = (counts[item] ?? 0) + 1
+  }
+  return Object.fromEntries(Object.entries(counts).sort((left, right) => right[1] - left[1]))
+}
+
+export function resultSummary(result: SearchResult): Record<string, unknown> {
+  return {
+    id: result.document.id,
+    title: result.document.title,
+    path: result.document.relativePath,
+    kind: result.document.kind,
+    score: Number(result.score.toFixed(3)),
+    metadata: result.document.metadata,
+    snippets: result.snippets,
+  }
+}

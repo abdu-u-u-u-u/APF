@@ -1,0 +1,179 @@
+import { existsSync } from "node:fs"
+import { homedir } from "node:os"
+import { join } from "node:path"
+import { startMcpServer, type McpToolDefinition } from "./protocol"
+import {
+  boundedContent,
+  buildMarkdownDocuments,
+  countByMetadata,
+  fileSize,
+  lookupDocument,
+  resultSummary,
+  searchDocuments,
+  type SearchDocument,
+} from "./search-core"
+
+const VERSION = "0.1.0"
+const ROOT = process.env.HACKTRICKS_ROOT ?? join(homedir(), "hacktricks")
+
+let documentCache: SearchDocument[] | undefined
+
+function stringArg(args: Record<string, unknown>, name: string, fallback = ""): string {
+  const value = args[name]
+  return typeof value === "string" ? value : fallback
+}
+
+function numberArg(args: Record<string, unknown>, name: string, fallback: number): number {
+  const value = args[name]
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback
+}
+
+function booleanArg(args: Record<string, unknown>, name: string, fallback = false): boolean {
+  const value = args[name]
+  return typeof value === "boolean" ? value : fallback
+}
+
+function documents(): SearchDocument[] {
+  if (!existsSync(ROOT)) return []
+  if (!documentCache) {
+    documentCache = buildMarkdownDocuments(ROOT, "hacktricks").map((document) => ({
+      ...document,
+      metadata: {
+        category: document.relativePath.split("/")[0] ?? "root",
+        size_bytes: fileSize(document.absolutePath),
+      },
+      weightedText: `${document.relativePath} ${document.title}`,
+    }))
+  }
+  return documentCache
+}
+
+function rootMissingResult(): Record<string, unknown> {
+  return {
+    ok: false,
+    root: ROOT,
+    reason: "HackTricks root does not exist. Set HACKTRICKS_ROOT or clone HackTricks at the default path.",
+  }
+}
+
+const searchTool: McpToolDefinition = {
+  name: "hacktricks_search",
+  description:
+    "Search the local HackTricks markdown corpus with ranked snippets. Use before reading full files to find relevant techniques, bypass notes, and methodology details.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      query: { type: "string", description: "Security concept, technology, primitive, or payload family to search for." },
+      limit: { type: "number", description: "Maximum results to return, 1-25. Default: 8." },
+      path_filter: { type: "string", description: "Optional case-insensitive substring filter on relative path/category." },
+      detail: { type: "string", enum: ["compact", "standard", "expanded"], description: "Snippet size/depth. Default: standard." },
+    },
+    required: ["query"],
+  },
+  execute(args) {
+    const docs = documents()
+    if (!docs.length) return rootMissingResult()
+    const query = stringArg(args, "query")
+    const detail = stringArg(args, "detail", "standard")
+    const results = searchDocuments(docs, query, {
+      limit: numberArg(args, "limit", 8),
+      pathFilter: stringArg(args, "path_filter"),
+      includeExpandedSnippets: detail === "expanded",
+    })
+    return {
+      ok: true,
+      root: ROOT,
+      query,
+      count: results.length,
+      results: results.map(resultSummary),
+      next: "Use hacktricks_read with a result id/path, or hacktricks_outline to inspect headings before reading.",
+    }
+  },
+}
+
+const readTool: McpToolDefinition = {
+  name: "hacktricks_read",
+  description:
+    "Read a bounded HackTricks document or heading section by result id/path. Use after hacktricks_search to inspect exact methodology details.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      id: { type: "string", description: "Result id, relative path, absolute path, or basename." },
+      heading: { type: "string", description: "Optional heading substring to read only one section." },
+      max_chars: { type: "number", description: "Maximum characters to return, 500-30000. Default: 12000." },
+      include_outline: { type: "boolean", description: "Include heading outline in the response. Default: false." },
+    },
+    required: ["id"],
+  },
+  execute(args) {
+    const docs = documents()
+    if (!docs.length) return rootMissingResult()
+    const id = stringArg(args, "id")
+    const document = lookupDocument(docs, id)
+    if (!document) return { ok: false, id, reason: "HackTricks document not found." }
+    const maxChars = numberArg(args, "max_chars", 12000)
+    const selected = boundedContent(document.content, maxChars, stringArg(args, "heading") || undefined)
+    return {
+      ok: true,
+      id: document.id,
+      title: document.title,
+      path: document.relativePath,
+      absolute_path: document.absolutePath,
+      metadata: document.metadata,
+      truncated: selected.truncated,
+      outline: booleanArg(args, "include_outline") ? document.headings : undefined,
+      content: selected.content,
+    }
+  },
+}
+
+const outlineTool: McpToolDefinition = {
+  name: "hacktricks_outline",
+  description: "Return the heading outline for a HackTricks document by result id/path.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      id: { type: "string", description: "Result id, relative path, absolute path, or basename." },
+      max_headings: { type: "number", description: "Maximum headings to return. Default: 120." },
+    },
+    required: ["id"],
+  },
+  execute(args) {
+    const docs = documents()
+    if (!docs.length) return rootMissingResult()
+    const id = stringArg(args, "id")
+    const document = lookupDocument(docs, id)
+    if (!document) return { ok: false, id, reason: "HackTricks document not found." }
+    const maxHeadings = Math.max(1, Math.min(numberArg(args, "max_headings", 120), 500))
+    return {
+      ok: true,
+      id: document.id,
+      title: document.title,
+      path: document.relativePath,
+      headings: document.headings.slice(0, maxHeadings),
+      truncated: document.headings.length > maxHeadings,
+    }
+  },
+}
+
+const statsTool: McpToolDefinition = {
+  name: "hacktricks_stats",
+  description: "Return local HackTricks corpus stats and category counts.",
+  inputSchema: { type: "object", properties: {} },
+  execute() {
+    const docs = documents()
+    if (!docs.length) return rootMissingResult()
+    return {
+      ok: true,
+      root: ROOT,
+      documents: docs.length,
+      categories: countByMetadata(docs, "category"),
+    }
+  },
+}
+
+startMcpServer({
+  name: "apf-hacktricks-mcp",
+  version: VERSION,
+  tools: [searchTool, readTool, outlineTool, statsTool],
+})

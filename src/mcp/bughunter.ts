@@ -1,0 +1,267 @@
+import { existsSync, readFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { basename, extname, join, relative } from "node:path"
+import { startMcpServer, type McpToolDefinition } from "./protocol"
+import {
+  boundedContent,
+  countByMetadata,
+  fileSize,
+  lookupDocument,
+  markdownChunks,
+  markdownHeadings,
+  markdownTitle,
+  normalizePathId,
+  resultSummary,
+  searchDocuments,
+  walkFiles,
+  type DocumentMetadata,
+  type SearchChunk,
+  type SearchDocument,
+} from "./search-core"
+
+const VERSION = "0.1.0"
+const ROOT = process.env.BUGHUNTER_ROOT ?? join(homedir(), "work", "abdu", "Claude-BugHunter")
+const TEXT_EXTENSIONS = [".md", ".markdown", ".py", ".sh", ".json", ".yaml", ".yml", ".txt"]
+
+let documentCache: SearchDocument[] | undefined
+
+function stringArg(args: Record<string, unknown>, name: string, fallback = ""): string {
+  const value = args[name]
+  return typeof value === "string" ? value : fallback
+}
+
+function numberArg(args: Record<string, unknown>, name: string, fallback: number): number {
+  const value = args[name]
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback
+}
+
+function booleanArg(args: Record<string, unknown>, name: string, fallback = false): boolean {
+  const value = args[name]
+  return typeof value === "boolean" ? value : fallback
+}
+
+function parseFrontmatter(content: string): Record<string, string> {
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/)
+  if (!match) return {}
+  const metadata: Record<string, string> = {}
+  for (const line of match[1].split(/\r?\n/)) {
+    const item = line.match(/^([A-Za-z0-9_-]+):\s*(.*?)\s*$/)
+    if (!item) continue
+    metadata[item[1]] = item[2].replace(/^["']|["']$/g, "")
+  }
+  return metadata
+}
+
+function classify(relativePath: string): string {
+  if (/^skills\/[^/]+\/SKILL\.md$/i.test(relativePath)) return "bughunter-skill"
+  if (/^commands\/[^/]+\.md$/i.test(relativePath)) return "bughunter-command"
+  if (relativePath.startsWith("docs/")) return "bughunter-doc"
+  if (relativePath.startsWith("scripts/")) return "bughunter-script"
+  if (relativePath.endsWith(".md")) return "bughunter-root-doc"
+  return "bughunter-file"
+}
+
+function firstMeaningfulLine(content: string): string {
+  return (
+    content
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line && !line.startsWith("---") && !line.startsWith("#!")) ?? ""
+  )
+}
+
+function plainTextChunks(content: string): SearchChunk[] {
+  const lines = content.split(/\r?\n/)
+  const chunks: SearchChunk[] = []
+  const chunkSize = 120
+  const overlap = 12
+  for (let index = 0; index < lines.length; index += chunkSize - overlap) {
+    const end = Math.min(lines.length, index + chunkSize)
+    chunks.push({
+      startLine: index + 1,
+      endLine: end,
+      text: lines.slice(index, end).join("\n"),
+    })
+    if (end >= lines.length) break
+  }
+  return chunks.length ? chunks : [{ startLine: 1, endLine: 1, text: content }]
+}
+
+function buildDocument(absolutePath: string): SearchDocument {
+  const content = readFileSync(absolutePath, "utf8")
+  const relativePath = relative(ROOT, absolutePath).replace(/\\/g, "/")
+  const extension = extname(relativePath).toLowerCase()
+  const frontmatter = parseFrontmatter(content)
+  const kind = classify(relativePath)
+  const title =
+    frontmatter.name ??
+    (extension === ".md" || extension === ".markdown" ? markdownTitle(content, basename(relativePath)) : basename(relativePath))
+  const metadata: DocumentMetadata = {
+    kind,
+    section: relativePath.split("/")[0] ?? "root",
+    name: frontmatter.name,
+    description: frontmatter.description,
+    size_bytes: fileSize(absolutePath),
+  }
+  const headings = extension === ".md" || extension === ".markdown" ? markdownHeadings(content) : []
+  const chunks = extension === ".md" || extension === ".markdown" ? markdownChunks(content) : plainTextChunks(content)
+  const description = frontmatter.description ?? firstMeaningfulLine(content)
+  return {
+    id: normalizePathId(relativePath),
+    title,
+    kind,
+    absolutePath,
+    relativePath,
+    content,
+    metadata,
+    headings,
+    chunks,
+    weightedText: [relativePath, kind, title, frontmatter.name, frontmatter.description, description].filter(Boolean).join(" "),
+  }
+}
+
+function documents(): SearchDocument[] {
+  if (!existsSync(ROOT)) return []
+  if (!documentCache) {
+    documentCache = walkFiles(ROOT, TEXT_EXTENSIONS).map(buildDocument)
+  }
+  return documentCache
+}
+
+function rootMissingResult(): Record<string, unknown> {
+  return {
+    ok: false,
+    root: ROOT,
+    reason: "Claude-BugHunter root does not exist. Set BUGHUNTER_ROOT or clone the repository at the default path.",
+  }
+}
+
+const searchTool: McpToolDefinition = {
+  name: "bughunter_search",
+  description:
+    "Search the full Claude-BugHunter repo: skills, slash-command docs, disclosed-report patterns, verification notes, and scripts.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      query: { type: "string", description: "Bug class, platform, command, workflow, report, or technique to search." },
+      limit: { type: "number", description: "Maximum results to return, 1-25. Default: 8." },
+      kind: {
+        type: "string",
+        description:
+          "Optional kind filter: bughunter-skill, bughunter-command, bughunter-doc, bughunter-script, bughunter-root-doc, bughunter-file.",
+      },
+      path_filter: { type: "string", description: "Optional case-insensitive substring filter on relative path." },
+      detail: { type: "string", enum: ["compact", "standard", "expanded"], description: "Snippet size/depth. Default: standard." },
+    },
+    required: ["query"],
+  },
+  execute(args) {
+    const docs = documents()
+    if (!docs.length) return rootMissingResult()
+    const query = stringArg(args, "query")
+    const kind = stringArg(args, "kind")
+    const detail = stringArg(args, "detail", "standard")
+    const results = searchDocuments(docs, query, {
+      limit: numberArg(args, "limit", 8),
+      pathFilter: stringArg(args, "path_filter"),
+      includeExpandedSnippets: detail === "expanded",
+      filter: kind ? (document) => document.kind === kind : undefined,
+    })
+    return {
+      ok: true,
+      root: ROOT,
+      query,
+      count: results.length,
+      results: results.map(resultSummary),
+      next: "Use bughunter_read with a result id/path before relying on specific guidance.",
+    }
+  },
+}
+
+const readTool: McpToolDefinition = {
+  name: "bughunter_read",
+  description: "Read a bounded Claude-BugHunter file or markdown heading section by result id/path.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      id: { type: "string", description: "Result id, relative path, absolute path, or basename." },
+      heading: { type: "string", description: "Optional markdown heading substring to read only one section." },
+      max_chars: { type: "number", description: "Maximum characters to return, 500-30000. Default: 12000." },
+      include_outline: { type: "boolean", description: "Include markdown heading outline in the response. Default: false." },
+    },
+    required: ["id"],
+  },
+  execute(args) {
+    const docs = documents()
+    if (!docs.length) return rootMissingResult()
+    const id = stringArg(args, "id")
+    const document = lookupDocument(docs, id)
+    if (!document) return { ok: false, id, reason: "Claude-BugHunter document not found." }
+    const selected = boundedContent(document.content, numberArg(args, "max_chars", 12000), stringArg(args, "heading") || undefined)
+    return {
+      ok: true,
+      id: document.id,
+      title: document.title,
+      path: document.relativePath,
+      absolute_path: document.absolutePath,
+      kind: document.kind,
+      metadata: document.metadata,
+      truncated: selected.truncated,
+      outline: booleanArg(args, "include_outline") ? document.headings : undefined,
+      content: selected.content,
+    }
+  },
+}
+
+const outlineTool: McpToolDefinition = {
+  name: "bughunter_outline",
+  description: "Return markdown headings for a Claude-BugHunter document by result id/path.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      id: { type: "string", description: "Result id, relative path, absolute path, or basename." },
+      max_headings: { type: "number", description: "Maximum headings to return. Default: 160." },
+    },
+    required: ["id"],
+  },
+  execute(args) {
+    const docs = documents()
+    if (!docs.length) return rootMissingResult()
+    const id = stringArg(args, "id")
+    const document = lookupDocument(docs, id)
+    if (!document) return { ok: false, id, reason: "Claude-BugHunter document not found." }
+    const maxHeadings = Math.max(1, Math.min(numberArg(args, "max_headings", 160), 600))
+    return {
+      ok: true,
+      id: document.id,
+      title: document.title,
+      path: document.relativePath,
+      kind: document.kind,
+      headings: document.headings.slice(0, maxHeadings),
+      truncated: document.headings.length > maxHeadings,
+    }
+  },
+}
+
+const statsTool: McpToolDefinition = {
+  name: "bughunter_stats",
+  description: "Return Claude-BugHunter corpus stats by file kind and top-level section.",
+  inputSchema: { type: "object", properties: {} },
+  execute() {
+    const docs = documents()
+    if (!docs.length) return rootMissingResult()
+    return {
+      ok: true,
+      root: ROOT,
+      documents: docs.length,
+      kinds: countByMetadata(docs, "kind"),
+      sections: countByMetadata(docs, "section"),
+    }
+  },
+}
+
+startMcpServer({
+  name: "apf-bughunter-mcp",
+  version: VERSION,
+  tools: [searchTool, readTool, outlineTool, statsTool],
+})

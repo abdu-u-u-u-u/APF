@@ -1,0 +1,378 @@
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, type Dirent } from "node:fs"
+import { dirname, join, relative } from "node:path"
+import { formatAuthStatus, summarizeAuthStatus, type AuthStatusSummary } from "./auth"
+import { formatNetworkStatus, summarizeNetworkStatus, type NetworkStatusSummary } from "./network"
+import { FRAMEWORK_DIRECTORIES, FRAMEWORK_TEMPLATE_FILES } from "./templates"
+import { readFrameworkState, type FrameworkState } from "./state"
+
+export type FrameworkInitResult = {
+  directory: string
+  created_directories: string[]
+  existing_directories: string[]
+  created_files: string[]
+  existing_files: string[]
+}
+
+export type FrameworkOperatorPolicySummary = {
+  present: boolean
+  mode?: string
+  preserve_operational_secrets?: boolean
+  redact_chat_output?: boolean
+  redact_reports?: boolean
+  allowed_secret_dirs: string[]
+}
+
+export type FrameworkAcceptancePolicySummary = {
+  present: boolean
+  accepted_report_severities: string[]
+  rejected_standalone_severities: string[]
+  allow_rejected_severities_as_chain_components?: boolean
+  candidate_threshold?: string
+  report_threshold?: string
+}
+
+export type ProgramSource = {
+  path: string
+  bytes: number
+}
+
+export type FrameworkStatusSummary = {
+  directory: string
+  initialized: boolean
+  state: FrameworkState
+  operator_policy?: FrameworkOperatorPolicySummary
+  acceptance_policy?: FrameworkAcceptancePolicySummary
+  auth?: AuthStatusSummary
+  network?: NetworkStatusSummary
+  lanes: string[]
+  candidates: string[]
+  severity_cards: string[]
+  debates: string[]
+  evidence: string[]
+  reports: string[]
+  notes: string[]
+  program_sources: ProgramSource[]
+  search_ledger_entries: number
+  missing_roots: string[]
+}
+
+export type SeverityCardSummary = {
+  finding_id: string
+  lane: string
+  effective_band: string
+  proof_status: string
+  attacker_control: string
+  reportable: boolean
+  evidence: string[]
+  high_blockers: string[]
+}
+
+const PROGRAM_SOURCE_EXTENSIONS = new Set(["md", "txt", "html", "htm", "json", "yaml", "yml", "csv"])
+const PROGRAM_SOURCE_ROOT_FILES = [
+  "PROGRAM.md",
+  "PROGRAM.txt",
+  "BOUNTY.md",
+  "BOUNTY.txt",
+  "BOUNTY_PROGRAM.md",
+  "SCOPE_RAW.md",
+  "SCOPE_RAW.txt",
+  "program.md",
+  "program.txt",
+  "scope_raw.md",
+  "scope_raw.txt",
+]
+const PROGRAM_SOURCE_IGNORE_FILES = new Set(["README.md"])
+
+function rel(directory: string, file: string): string {
+  return relative(directory, file) || "."
+}
+
+function fileSize(file: string): number {
+  try {
+    return readFileSync(file).byteLength
+  } catch {
+    return 0
+  }
+}
+
+function readJsonFile<T>(path: string, fallback: T): T {
+  try {
+    if (!existsSync(path)) return fallback
+    return JSON.parse(readFileSync(path, "utf8")) as T
+  } catch {
+    return fallback
+  }
+}
+
+function countLines(file: string): number {
+  if (!existsSync(file)) return 0
+  return readFileSync(file, "utf8")
+    .split(/\r?\n/)
+    .filter(Boolean).length
+}
+
+function listFiles(root: string, max = 30): string[] {
+  if (!existsSync(root)) return []
+  const results: string[] = []
+  const walk = (dir: string): void => {
+    if (results.length >= max) return
+    let entries: Dirent[]
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (results.length >= max) return
+      if (entry.name.startsWith(".")) continue
+      const path = join(dir, entry.name)
+      if (entry.isDirectory()) {
+        walk(path)
+      } else {
+        results.push(path)
+      }
+    }
+  }
+  walk(root)
+  return results
+}
+
+function readOperatorPolicy(directory: string): FrameworkOperatorPolicySummary {
+  const file = join(directory, "framework", "operator-policy.json")
+  if (!existsSync(file)) return { present: false, allowed_secret_dirs: [] }
+  try {
+    const policy = JSON.parse(readFileSync(file, "utf8")) as {
+      secrets?: {
+        mode?: unknown
+        preserve_operational_secrets?: unknown
+        redact_chat_output?: unknown
+        redact_reports?: unknown
+        allowed_secret_dirs?: unknown
+      }
+    }
+    const secrets = policy.secrets ?? {}
+    return {
+      present: true,
+      mode: typeof secrets.mode === "string" ? secrets.mode : undefined,
+      preserve_operational_secrets:
+        typeof secrets.preserve_operational_secrets === "boolean" ? secrets.preserve_operational_secrets : undefined,
+      redact_chat_output: typeof secrets.redact_chat_output === "boolean" ? secrets.redact_chat_output : undefined,
+      redact_reports: typeof secrets.redact_reports === "boolean" ? secrets.redact_reports : undefined,
+      allowed_secret_dirs: Array.isArray(secrets.allowed_secret_dirs)
+        ? secrets.allowed_secret_dirs.filter((dir): dir is string => typeof dir === "string")
+        : [],
+    }
+  } catch {
+    return { present: false, allowed_secret_dirs: [] }
+  }
+}
+
+function readAcceptancePolicy(directory: string): FrameworkAcceptancePolicySummary {
+  const file = join(directory, "framework", "acceptance-policy.json")
+  if (!existsSync(file)) {
+    return {
+      present: false,
+      accepted_report_severities: ["high", "critical"],
+      rejected_standalone_severities: ["informational", "info", "low", "medium"],
+    }
+  }
+  try {
+    const policy = JSON.parse(readFileSync(file, "utf8")) as {
+      accepted_report_severities?: unknown
+      rejected_standalone_severities?: unknown
+      allow_rejected_severities_as_chain_components?: unknown
+      candidate_threshold?: unknown
+      report_threshold?: unknown
+    }
+    return {
+      present: true,
+      accepted_report_severities: Array.isArray(policy.accepted_report_severities)
+        ? policy.accepted_report_severities.filter((severity): severity is string => typeof severity === "string")
+        : ["high", "critical"],
+      rejected_standalone_severities: Array.isArray(policy.rejected_standalone_severities)
+        ? policy.rejected_standalone_severities.filter((severity): severity is string => typeof severity === "string")
+        : ["informational", "info", "low", "medium"],
+      allow_rejected_severities_as_chain_components:
+        typeof policy.allow_rejected_severities_as_chain_components === "boolean"
+          ? policy.allow_rejected_severities_as_chain_components
+          : undefined,
+      candidate_threshold: typeof policy.candidate_threshold === "string" ? policy.candidate_threshold : undefined,
+      report_threshold: typeof policy.report_threshold === "string" ? policy.report_threshold : undefined,
+    }
+  } catch {
+    return {
+      present: false,
+      accepted_report_severities: ["high", "critical"],
+      rejected_standalone_severities: ["informational", "info", "low", "medium"],
+    }
+  }
+}
+
+export function listProgramSources(directory: string): ProgramSource[] {
+  const seen = new Set<string>()
+  const sources: ProgramSource[] = []
+
+  const add = (path: string): void => {
+    if (seen.has(path) || !existsSync(path)) return
+    seen.add(path)
+    sources.push({ path: rel(directory, path), bytes: fileSize(path) })
+  }
+
+  for (const file of PROGRAM_SOURCE_ROOT_FILES) add(join(directory, file))
+
+  const programDir = join(directory, "program")
+  const walk = (dir: string): void => {
+    let entries: Dirent[]
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith(".") || PROGRAM_SOURCE_IGNORE_FILES.has(entry.name)) continue
+      const path = join(dir, entry.name)
+      if (entry.isDirectory()) {
+        walk(path)
+        continue
+      }
+      const extension = entry.name.toLowerCase().split(".").pop() ?? ""
+      if (PROGRAM_SOURCE_EXTENSIONS.has(extension)) add(path)
+    }
+  }
+  walk(programDir)
+
+  return sources.sort((a, b) => a.path.localeCompare(b.path))
+}
+
+export function initializeFrameworkWorkspace(directory: string): FrameworkInitResult {
+  const result: FrameworkInitResult = {
+    directory,
+    created_directories: [],
+    existing_directories: [],
+    created_files: [],
+    existing_files: [],
+  }
+
+  for (const dir of FRAMEWORK_DIRECTORIES) {
+    const path = join(directory, dir)
+    if (existsSync(path)) {
+      result.existing_directories.push(dir)
+      continue
+    }
+    mkdirSync(path, { recursive: true })
+    result.created_directories.push(dir)
+  }
+
+  for (const [file, contents] of Object.entries(FRAMEWORK_TEMPLATE_FILES)) {
+    const path = join(directory, file)
+    if (existsSync(path)) {
+      result.existing_files.push(file)
+      continue
+    }
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, contents)
+    result.created_files.push(file)
+  }
+
+  return result
+}
+
+export function summarizeFrameworkStatus(directory: string): FrameworkStatusSummary {
+  const state = readFrameworkState(directory)
+  const missingRoots = FRAMEWORK_DIRECTORIES.filter((dir) => !existsSync(join(directory, dir)))
+  const coveragePath = join(directory, "framework", "coverage.md")
+  const lanesFromCoverage = existsSync(coveragePath)
+    ? readFileSync(coveragePath, "utf8")
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith("| ") && !line.includes("---") && !line.includes("Lane |"))
+        .map((line) =>
+          line
+            .split("|")
+            .map((cell) => cell.trim())
+            .filter(Boolean)
+            .slice(0, 4)
+            .join(" | "),
+        )
+    : []
+  const lanes =
+    lanesFromCoverage.length > 0
+      ? lanesFromCoverage
+      : Object.entries(state.lanes).map(([name, lane]) => [name, lane.state, lane.evidence?.slice(0, 2).join(","), lane.next_action].filter(Boolean).join(" | "))
+
+  return {
+    directory,
+    initialized: existsSync(join(directory, "framework", "state.json")),
+    state,
+    operator_policy: readOperatorPolicy(directory),
+    acceptance_policy: readAcceptancePolicy(directory),
+    auth: summarizeAuthStatus(directory),
+    network: summarizeNetworkStatus(directory),
+    lanes,
+    candidates: listFiles(join(directory, "findings", "candidates")).map((file) => rel(directory, file)),
+    severity_cards: listFiles(join(directory, "findings", "candidates"))
+      .map((file) => rel(directory, file))
+      .filter((file) => file.endsWith(".severity.json")),
+    debates: listFiles(join(directory, "findings", "debates")).map((file) => rel(directory, file)),
+    evidence: listFiles(join(directory, "evidence")).map((file) => rel(directory, file)),
+    reports: listFiles(join(directory, "reports")).map((file) => rel(directory, file)),
+    notes: listFiles(join(directory, "framework", "notes")).map((file) => rel(directory, file)),
+    program_sources: listProgramSources(directory),
+    search_ledger_entries: countLines(join(directory, "framework", "search-ledger.jsonl")),
+    missing_roots: missingRoots,
+  }
+}
+
+export function formatFrameworkStatus(summary: FrameworkStatusSummary): string {
+  const artifactCounts = [
+    `program_sources=${summary.program_sources.length}`,
+    `candidates=${summary.candidates.length}`,
+    `severity_cards=${summary.severity_cards.length}`,
+    `debates=${summary.debates.length}`,
+    `evidence=${summary.evidence.length}`,
+    `reports=${summary.reports.length}`,
+    `notes=${summary.notes.length}`,
+    `search_ledger=${summary.search_ledger_entries}`,
+  ].join(" ")
+  const lines = [
+    "# APF Status",
+    "",
+    `- Mode: ${summary.state.single_ai.agent} primary + optional Codex workstreams; workstreams=${summary.state.single_ai.no_subagents ? "disabled" : "enabled"} judge_workflow=${summary.state.single_ai.no_judge_workflow ? "disabled" : "enabled"}`,
+    `- Run status: ${summary.state.status}`,
+    `- Target: ${summary.state.target.name ?? "unknown"}`,
+    `- Authorization: ${summary.state.target.authorization ?? "unknown"}`,
+    `- Current focus: ${summary.state.current_focus ?? "none"}`,
+    `- Accepted report severities: ${(summary.acceptance_policy?.accepted_report_severities ?? ["high", "critical"]).join(", ")}`,
+    `- Rejected standalone severities: ${(summary.acceptance_policy?.rejected_standalone_severities ?? ["informational", "info", "low", "medium"]).join(", ")}`,
+    `- Artifacts: ${artifactCounts}`,
+    "",
+    "## Next Actions",
+    ...(summary.state.next_actions.length ? summary.state.next_actions.map((item) => `- ${item}`) : ["- none"]),
+    "",
+    "## Auth",
+    ...(summary.auth ? formatAuthStatus(summary.auth) : ["- unavailable"]),
+    "",
+    "## Network",
+    ...(summary.network ? formatNetworkStatus(summary.network) : ["- unavailable"]),
+    "",
+    "## Lanes",
+    ...(summary.lanes.length ? summary.lanes.slice(0, 12).map((lane) => `- ${lane}`) : ["- none"]),
+    "",
+    "## Findings",
+    ...(Object.values(summary.state.findings).length
+      ? Object.values(summary.state.findings)
+          .slice(0, 12)
+          .map((finding) => `- ${finding.id}: ${finding.state}${finding.severity ? ` ${finding.severity}` : ""} - ${finding.title}`)
+      : ["- none"]),
+    "",
+    "## Setup Problems",
+    ...(summary.missing_roots.length ? summary.missing_roots.map((dir) => `- missing ${dir}`) : ["- none"]),
+  ]
+  return lines.join("\n")
+}
+
+export function readSeverityCards(directory: string): SeverityCardSummary[] {
+  return listFiles(join(directory, "findings", "candidates"), 200)
+    .filter((file) => file.endsWith(".severity.json"))
+    .map((file) => readJsonFile<SeverityCardSummary | undefined>(file, undefined))
+    .filter((card): card is SeverityCardSummary => Boolean(card))
+}
