@@ -15,11 +15,12 @@ codex plugin add abdus-codex-pentest-framework@abdus-codex
 
 Start a new Codex thread after install so the plugin skills and MCP declarations are loaded.
 
-The default install is intentionally minimal so it starts cleanly on fresh machines. Use the plugin from Codex prompts:
+The plugin ships APF skills, local MCP declarations, and the bundled Pentest Intel Corpus webapp. Use it from Codex prompts:
 
 ```text
 @acpf initialize an APF workspace for this HackerOne program
-@acpf configure optional local scanner and reference MCPs
+@acpf spin up the pentest intel corpus and register this workspace
+@acpf configure optional local scanner, reference, and Burp Suite MCPs
 ```
 
 ## Plugin Source
