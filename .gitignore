@@ -11,3 +11,8 @@ coverage/
 *.local
 *.local.*
 plugins/abdus-codex-pentest-framework/corpus/node_modules/
+
+# Root-local agent/runtime artifacts.
+/.commandcode/
+/intel/
+/--timeout=*
