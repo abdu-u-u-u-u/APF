@@ -4,7 +4,7 @@ This repository is a Codex plugin marketplace.
 
 It publishes one plugin:
 
-- `abdus-codex-pentest-framework`: Codex-first APF workspace scaffolding, pentest skills, and local MCP wiring.
+- `abdus-codex-pentest-framework`: Codex-first APF workspace scaffolding, pentest skills, and local MCP wiring. Durable organizational knowledge (targets, surfaces, lanes, maps, findings, reports) is represented in the [Open Knowledge Format (OKF) v0.1](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md).
 
 ## Install
 
