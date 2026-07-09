@@ -16,3 +16,5 @@ plugins/abdus-codex-pentest-framework/corpus/node_modules/
 /.commandcode/
 /intel/
 /--timeout=*
+/browser/
+/apf-hermes-playground/
