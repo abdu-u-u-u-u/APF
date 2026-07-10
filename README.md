@@ -1,6 +1,6 @@
 # acpf
 
-Codex-, Claude Code-, OpenCode-, and Hermes-compatible APF pentest workspace framework for bug bounty and application security work.
+Codex-, Claude Code-, and OpenCode-compatible APF pentest workspace framework for bug bounty and application security work.
 
 This repository ships one plugin:
 
@@ -16,11 +16,10 @@ The plugin lives at:
 plugins/abdus-codex-pentest-framework/
 ```
 
-It carries plugin manifests for Codex and Claude Code, plus a generated workspace layer for Hermes:
+It carries plugin manifests for Codex and Claude Code:
 
 - Codex: `plugins/abdus-codex-pentest-framework/.codex-plugin/plugin.json`
 - Claude Code: `plugins/abdus-codex-pentest-framework/.claude-plugin/plugin.json`
-- Hermes: generated APF workspaces include `.hermes.md` and `.hermes/`
 
 Build and test from that directory:
 
@@ -34,7 +33,7 @@ bun run typecheck
 
 ## Use It
 
-The primary entry point is the `acpf` workspace spinup command. Create a target workspace, then open it in Codex, OpenCode, Claude Code, or Hermes:
+The primary entry point is the `acpf` workspace spinup command. Create a target workspace, then open it in Codex, OpenCode, or Claude Code:
 
 ```bash
 cd plugins/abdus-codex-pentest-framework
@@ -42,7 +41,7 @@ bun run acpf -- spinup ~/targets/acme --target acme.com
 cd ~/targets/acme
 ```
 
-Generated workspaces are runtime-portable. Codex and OpenCode read `AGENTS.md`; Claude Code reads `CLAUDE.md` (which imports `AGENTS.md`); Hermes reads `.hermes.md`, which points it at the shared APF instructions and Hermes-local helper scripts. Each workspace ships `.codex/`, `.claude/`, `.opencode/`, and `.hermes/` config/helper material plus workspace-local APF skills and scripts.
+Generated workspaces are runtime-portable. Codex and OpenCode read `AGENTS.md`; Claude Code reads `CLAUDE.md`, which imports `AGENTS.md`. Each workspace ships `.codex/`, `.claude/`, and `.opencode/` config/helper material plus workspace-local APF skills and scripts.
 
 APF is agentic-first and hierarchical. The opened root session is the root manager; it delegates bounded phases and lanes to sub-managers, never directly to execution workers. Each sub-manager dispatches a research/pentest leaf wave and a unique independent `judge_leaf` for the attempt plus one for every finding candidate. Judge leaves check current web research, CVEs/advisories, tool documentation, and replay evidence, then return `advance`, `reject`, `retry_different_approach`, or `blocked`. Retries are capped at depth three; each requires a materially different approach, a new executor wave, and new judges. A mandatory judged `recon_mapping` phase publishes a sealed surfaced handoff; testing stays blocked until that recon run is successfully finalized. Finalized handoffs are indexed in `framework/manager-handoffs.jsonl` so sibling managers consume compact surfaced context. If the selected runtime cannot provide distinct live host-native sessions for this graph, APF stops before target work; identity strings in workspace files do not count as agent creation.
 
@@ -59,9 +58,6 @@ opencode
 claude
 # then type: start
 
-# Hermes
-hermes
-# then type: start
 ```
 
 ## Register In Your Own Marketplace
