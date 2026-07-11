@@ -17,3 +17,5 @@ plugins/abdus-codex-pentest-framework/corpus/node_modules/
 /intel/
 /--timeout=*
 /browser/
+/plugins/abdus-codex-pentest-framework/framework/
+/.opencode/goals/
