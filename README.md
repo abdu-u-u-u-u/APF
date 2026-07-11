@@ -45,6 +45,8 @@ Generated workspaces are runtime-portable. Codex and OpenCode read `AGENTS.md`; 
 
 APF is agentic-first and hierarchical. The opened root session is the root manager; it delegates bounded phases and lanes to sub-managers, never directly to execution workers. Each sub-manager dispatches a research/pentest leaf wave and a unique independent `judge_leaf` for the attempt plus one for every finding candidate. Judge leaves check current web research, CVEs/advisories, tool documentation, and replay evidence, then return `advance`, `reject`, `retry_different_approach`, or `blocked`. Retries are capped at depth three; each requires a materially different approach, a new executor wave, and new judges. A mandatory judged `recon_mapping` phase publishes a sealed surfaced handoff; testing stays blocked until that recon run is successfully finalized. Finalized handoffs are indexed in `framework/manager-handoffs.jsonl` so sibling managers consume compact surfaced context. If the selected runtime cannot provide distinct live host-native sessions for this graph, APF stops before target work; identity strings in workspace files do not count as agent creation.
 
+Every manager explicitly selects `gpt-5.6-luna` for every child-agent spawn—root to sub-manager and sub-manager to executor or judge leaf. APF does not permit inherited/default or fallback child models; an unavailable exact override is an orchestration blocker.
+
 ```bash
 # Codex
 codex --search
