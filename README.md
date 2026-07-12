@@ -1,6 +1,6 @@
 # acpf
 
-Codex-, Claude Code-, and OpenCode-compatible APF pentest workspace framework for bug bounty and application security work.
+Codex-first APF pentest workspace framework for bug bounty and application security work. Workspace files remain readable by Claude Code and OpenCode, but live hierarchical orchestration currently requires Codex and exact `gpt-5.6-luna` child attestation.
 
 This repository ships one plugin:
 
@@ -33,31 +33,23 @@ bun run typecheck
 
 ## Use It
 
-The primary entry point is the `acpf` workspace spinup command. Create a target workspace, then open it in Codex, OpenCode, or Claude Code:
+The primary entry point is the `acpf` workspace spinup command. Create a target workspace, then launch it through APF into Codex:
 
 ```bash
 cd plugins/abdus-codex-pentest-framework
 bun run acpf -- spinup ~/targets/acme --target acme.com
-cd ~/targets/acme
+bun run acpf -- launch ~/targets/acme --runtime codex
 ```
 
-Generated workspaces are runtime-portable. Codex and OpenCode read `AGENTS.md`; Claude Code reads `CLAUDE.md`, which imports `AGENTS.md`. Each workspace ships `.codex/`, `.claude/`, and `.opencode/` config/helper material plus workspace-local APF skills and scripts.
+Generated workspace files are runtime-portable. Codex and OpenCode read `AGENTS.md`; Claude Code reads `CLAUDE.md`, which imports `AGENTS.md`. Each workspace ships `.codex/`, `.claude/`, and `.opencode/` config/helper material plus workspace-local APF skills and scripts. Live APF runs currently fail closed outside Codex because other runtimes cannot attest the mandatory Luna child model.
 
-APF is agentic-first and hierarchical. The opened root session is the root manager; it delegates bounded phases and lanes to sub-managers, never directly to execution workers. Each sub-manager dispatches a research/pentest leaf wave and a unique independent `judge_leaf` for the attempt plus one for every finding candidate. Judge leaves check current web research, CVEs/advisories, tool documentation, and replay evidence, then return `advance`, `reject`, `retry_different_approach`, or `blocked`. Retries are capped at depth three; each requires a materially different approach, a new executor wave, and new judges. A mandatory judged `recon_mapping` phase publishes a sealed surfaced handoff; testing stays blocked until that recon run is successfully finalized. Finalized handoffs are indexed in `framework/manager-handoffs.jsonl` so sibling managers consume compact surfaced context. If the selected runtime cannot provide distinct live host-native sessions for this graph, APF stops before target work; identity strings in workspace files do not count as agent creation.
+APF is agentic-first and hierarchical. The opened root session is the root manager; it delegates phases and lanes to scope-owned sub-managers, never directly to execution workers. Each sub-manager dispatches a research/pentest leaf wave and a unique independent `judge_leaf` for the attempt plus one for every finding candidate. Judge leaves check current web research, CVEs/advisories, tool documentation, and replay evidence, then return `advance`, `reject`, `retry_different_approach`, or `blocked`. Judge-ordered retries continue while a materially different useful approach remains; each requires a new executor wave and new judges. A mandatory judged `recon_mapping` phase publishes a sealed surfaced handoff; testing stays blocked until that recon run is successfully finalized. Finalized handoffs are indexed in `framework/manager-handoffs.jsonl` so sibling managers consume compact surfaced context. If the selected runtime cannot provide distinct live host-native sessions for this graph, APF stops before target work; identity strings in workspace files do not count as agent creation.
+
+Every manager explicitly selects `gpt-5.6-luna` for every child-agent spawn—root to sub-manager and sub-manager to executor or judge leaf. APF does not permit inherited/default or fallback child models; an unavailable exact override is an orchestration blocker.
 
 ```bash
-# Codex
-codex --search
+bun run acpf -- launch ~/targets/acme --runtime codex
 # then type: start
-
-# OpenCode
-opencode
-# then type: start
-
-# Claude Code
-claude
-# then type: start
-
 ```
 
 ## Register In Your Own Marketplace
