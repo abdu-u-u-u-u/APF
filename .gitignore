@@ -7,7 +7,6 @@ coverage/
 
 # Local/generated runtime state. Never commit pentest workspace data.
 .acpf/
-.playwright-mcp/
 *.local
 *.local.*
 plugins/abdus-codex-pentest-framework/corpus/node_modules/
