@@ -51,6 +51,8 @@ bun run test
 bun run typecheck
 ```
 
+`bun run test` uses the fast suite. Use `bun run test:full` for the two long orchestration stress suites as well.
+
 ## Use It
 
 The primary entry point is the `acpf` CLI. Plugin installation loads skills; it does not by itself link the CLI into `PATH`. Link/install the package separately before using `acpf`.
@@ -60,11 +62,11 @@ On native Windows:
 ```powershell
 Set-Location .\plugins\abdus-codex-pentest-framework
 bun run acpf -- spinup 'C:\apf\targets\acme' --target acme.com
-bun run acpf -- launch 'C:\apf\targets\acme' --runtime codex
-Set-Location 'C:\apf\targets\acme'
 ```
 
-After `bun link`, the shorter form is `acpf spinup ...` and `acpf launch ...`.
+Open the generated workspace in Codex Desktop and say `start`, `begin`, `go`, `start recon`, or another clear request to begin. The root agent verifies and attaches the current Desktop task, then starts recon itself; `acpf` does not need to be globally linked or present on that task's `PATH`. Use `bun run acpf -- launch 'C:\apf\targets\acme' --runtime codex` only when you explicitly want a separate CLI-launched session.
+
+After `bun link`, the shorter CLI forms are `acpf spinup ...` and `acpf launch ...`.
 
 On Linux/WSL:
 
@@ -78,21 +80,11 @@ Generated workspaces use platform-neutral Node helpers and Windows-first PowerSh
 
 APF is agentic-first and hierarchical. The opened root session is the root manager; it delegates bounded phases and lanes to sub-managers, never directly to execution workers. Each sub-manager dispatches a research/pentest leaf wave and a unique independent `judge_leaf` for the attempt plus one for every finding candidate. Judge leaves check current web research, CVEs/advisories, tool documentation, and replay evidence, then return `advance`, `reject`, `retry_different_approach`, or `blocked`. Retries are capped at depth three; each requires a materially different approach, a new executor wave, and new judges. A mandatory judged `recon_mapping` phase publishes a sealed surfaced handoff; testing stays blocked until that recon run is successfully finalized. Finalized handoffs are indexed in `framework/manager-handoffs.jsonl` so sibling managers consume compact surfaced context. If the selected runtime cannot provide distinct live host-native sessions for this graph, APF stops before target work; identity strings in workspace files do not count as agent creation.
 
+Codex Desktop multi-agent v1 has one narrow compatibility path when a bound sub-manager lacks nested spawn tools: the manager returns an `APF_DESKTOP_V1_PROXY_REQUEST`, and the root mechanically reserves, spawns, binds, attests, and dispatches its Luna/no-fork executor or judge leaves. The root performs no target work or judging and resumes the same logical manager with raw results. Desktop v2 keeps native sub-manager-to-leaf depth-2 spawning.
+
 Every manager explicitly selects `gpt-5.6-luna` for every child-agent spawn—root to sub-manager and sub-manager to executor or judge leaf. APF does not permit inherited/default or fallback child models; an unavailable exact override is an orchestration blocker.
 
-```powershell
-# Codex
-codex --search
-# then type: start
-
-# OpenCode
-opencode
-# then type: start
-
-# Claude Code
-claude
-# then type: start
-```
+Codex Desktop is the supported live runtime for the attested Luna hierarchy. A clear natural-language start request is enough; exact literal matching is not required. Inactive runtime state, unknown authorization, unstarted recon, and a pending recon gate are normal startup conditions. The gate blocks testing until recon is judged and finalized, but it does not block starting recon.
 
 ## Register In Your Own Marketplace
 
