@@ -78,7 +78,7 @@ cd ~/targets/acme
 
 Generated workspaces use platform-neutral Node helpers and Windows-first PowerShell runbooks on this branch. Codex and OpenCode read `AGENTS.md`; Claude Code reads `CLAUDE.md`, which imports `AGENTS.md`. Each workspace ships `.codex/`, `.claude/`, and `.opencode/` config/helper material plus workspace-local APF skills and scripts. Android-device commands under `/data/local/tmp` remain device-side shell commands and are valid from a Windows host through `adb shell`.
 
-APF Lite is root-first. A clear natural-language request starts target work immediately in the current task; exact wording is not required. Inactive runtime state, unknown authorization, unstarted recon, and a pending gate are work inputs, not launcher or orchestration blockers.
+APF Lite is root-first. A clear natural-language request starts target work immediately in the current task; exact wording is not required. Inactive runtime state, unstarted recon, and a pending gate are work inputs, not launcher or orchestration blockers.
 
 For a broad pentest, broad recon, or open-ended finding goal, the root starts working and spawns one executor by default with a short work-only assignment. A narrow bounded goal may remain in the root task. Add a second executor only for a complementary independent branch; if no child slot is available, the root continues instead of blocking. Routine attempts do not create judges, while concrete finding candidates receive independent validation before promotion.
 
